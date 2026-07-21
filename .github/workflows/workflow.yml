@@ -78,6 +78,19 @@ jobs:
           echo "image=${IMAGE}" >> $GITHUB_OUTPUT
           echo "image_latest=${IMAGE_LATEST}" >> $GITHUB_OUTPUT
 
+          # On a tag push, also tag the image with the tag name itself
+          # (e.g. v1.0.0), so releases are pullable by a human-readable
+          # version instead of only by commit SHA or :latest.
+          TAGS="${IMAGE}"$'\n'"${IMAGE_LATEST}"
+          if [[ "${{ github.ref }}" == refs/tags/* ]]; then
+            TAGS="${TAGS}"$'\n'"${{ env.REGISTRY }}/${REPO_LOWER}:${{ github.ref_name }}"
+          fi
+          {
+            echo "tags<<EOF"
+            echo "$TAGS"
+            echo "EOF"
+          } >> $GITHUB_OUTPUT
+
           echo "${IMAGE}" >> $GITHUB_STEP_SUMMARY
 
       - name: Build and push docker image
@@ -89,9 +102,7 @@ jobs:
           platforms: linux/amd64,linux/arm64,windows/amd64,windows/arm64,darwin/amd64,darwin/arm64,linux/arm/v7,linux/arm/v8,linux/s390x
           cache-from: type=registry,ref=${{ steps.image-ref.outputs.image_latest }}
           cache-to: type=inline
-          tags: |
-            ${{ steps.image-ref.outputs.image }}
-            ${{ steps.image-ref.outputs.image_latest }}
+          tags: ${{ steps.image-ref.outputs.tags }}
   releaser:
     if: startsWith(github.ref, 'refs/tags/')
     needs:

@@ -59,6 +59,9 @@ jobs:
       - lint
       - test
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
     outputs:
       image: ${{ steps.image-ref.outputs.image }}
       image_latest: ${{ steps.image-ref.outputs.image_latest }}

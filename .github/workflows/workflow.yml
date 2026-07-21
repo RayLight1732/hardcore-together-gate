@@ -69,12 +69,15 @@ jobs:
         id: image-ref
         run: |
           REF=$(git rev-parse --short $GITHUB_SHA)
-          IMAGE=${{ env.REGISTRY }}/${{ github.repository }}:${REF}
-          IMAGE_LATEST=${{ env.REGISTRY }}/${{ github.repository }}:latest
-          
-          echo "image=${IMAGE}" >> $GITHUB_STATE
+          # Registry repository names must be lowercase; github.repository
+          # preserves the owner/repo casing as-is (e.g. RayLight1732/...).
+          REPO_LOWER=$(echo "${{ github.repository }}" | tr '[:upper:]' '[:lower:]')
+          IMAGE=${{ env.REGISTRY }}/${REPO_LOWER}:${REF}
+          IMAGE_LATEST=${{ env.REGISTRY }}/${REPO_LOWER}:latest
+
+          echo "image=${IMAGE}" >> $GITHUB_OUTPUT
           echo "image_latest=${IMAGE_LATEST}" >> $GITHUB_OUTPUT
-          
+
           echo "${IMAGE}" >> $GITHUB_STEP_SUMMARY
 
       - name: Build and push docker image

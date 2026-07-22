@@ -15,7 +15,7 @@ func loadCommand(d *deps) brigodier.LiteralNodeBuilder {
 		return command.Command(func(ctx *command.Context) error {
 			name := ctx.String("name")
 
-			reqCtx, cancel := context.WithTimeout(context.Background(), commandTimeout)
+			reqCtx, cancel := context.WithTimeout(context.Background(), startupTimeout)
 			defer cancel()
 
 			result, err := d.client.Load(reqCtx, name, force, requesterName(ctx.Source))

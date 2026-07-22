@@ -42,11 +42,15 @@ func (d *deps) onEvacuateRequest(ctx context.Context, reason string) {
 	wg.Wait()
 }
 
-// evacuateMessage returns the notification wording specified in docs/specification.md 2.1節.
+// evacuateMessage returns the notification wording specified in
+// docs/protocol-gate-manager.md 3.5節 / docs/specification.md 2.1節.
 func evacuateMessage(reason string) c.Component {
-	text := "ワールドリセットのためロビーに戻りました"
-	if reason == "force-reset" {
-		text = "管理者により強制リセットされました"
+	switch reason {
+	case "force-reset":
+		return infoText("管理者により強制リセットされました")
+	case "deactivate":
+		return infoText("サーバー停止のためロビーに戻りました")
+	default:
+		return infoText("ワールドリセットのためロビーに戻りました")
 	}
-	return infoText(text)
 }

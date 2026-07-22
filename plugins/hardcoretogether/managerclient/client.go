@@ -29,6 +29,7 @@ const (
 	StateStopped  State = "stopped"
 	StateStarting State = "starting"
 	StateReady    State = "ready"
+	StateStopping State = "stopping"
 )
 
 // Running is hardcore's running flag as cached by Manager.
@@ -88,12 +89,17 @@ type message struct {
 	State   string `json:"state,omitempty"`
 	Running string `json:"running,omitempty"`
 
-	// start / load
-	Force       bool   `json:"force,omitempty"`
+	// start
+	Clean bool `json:"clean,omitempty"`
+
+	// load
+	Force bool `json:"force,omitempty"`
+
+	// start / load / deactivate
 	RequestedBy string `json:"requestedBy,omitempty"`
 	Name        string `json:"name,omitempty"`
 
-	// start-rejected / load-rejected / evacuate-request
+	// start-rejected / load-rejected / deactivate-rejected / evacuate-request
 	Reason string `json:"reason,omitempty"`
 
 	// savedata-response
@@ -117,6 +123,9 @@ type Client struct {
 	// OnHardcoreReady is called for every hardcore-ready notification
 	// (docs/protocol-gate-manager.md 3.1a節).
 	OnHardcoreReady func(ctx context.Context)
+	// OnDeactivateComplete is called for every deactivate-complete
+	// notification (docs/protocol-gate-manager.md 3.5a節).
+	OnDeactivateComplete func(ctx context.Context)
 
 	connMu sync.Mutex
 	conn   net.Conn
@@ -202,15 +211,26 @@ func (c *Client) readLoop(conn net.Conn) {
 func (c *Client) dispatch(msg message) {
 	switch msg.Type {
 	case "hardcore-ready":
+		// When the target process was already stopped, start/load are
+		// accepted with no other acknowledgement at all (docs/protocol-gate-manager.md
+		// 3.2節) — hardcore-ready is the only signal a pending call() ever
+		// gets in that case, so deliver it in addition to handling it as
+		// the usual push (auto-transfer via OnHardcoreReady).
+		c.deliver(msg)
 		if c.OnHardcoreReady != nil {
 			go c.OnHardcoreReady(context.Background())
 		}
 	case "evacuate-request":
 		// evacuate-request doubles as the "accepted" outcome of a pending
-		// start/load call (docs/protocol-gate-manager.md 4節), so deliver
-		// it to any waiting call() in addition to handling it as a push.
+		// start/load/deactivate call (docs/protocol-gate-manager.md 4節),
+		// so deliver it to any waiting call() in addition to handling it
+		// as a push.
 		c.deliver(msg)
 		go c.handleEvacuateRequest(msg)
+	case "deactivate-complete":
+		if c.OnDeactivateComplete != nil {
+			go c.OnDeactivateComplete(context.Background())
+		}
 	default:
 		c.deliver(msg)
 	}
@@ -304,9 +324,15 @@ func (c *Client) QueryState(ctx context.Context) (State, Running, error) {
 	return State(resp.State), Running(resp.Running), nil
 }
 
-// Start sends a /start request (docs/protocol-gate-manager.md 3.2節).
-func (c *Client) Start(ctx context.Context, force bool, requestedBy string) (CommandResult, error) {
-	resp, err := c.call(ctx, message{Type: "start", Force: force, RequestedBy: requestedBy})
+// Start sends a /start [clean] request (docs/protocol-gate-manager.md 3.2節).
+// When clean is false and the target process was already stopped (the only
+// state from which a non-clean start is accepted), Manager sends no
+// immediate acknowledgement at all — the call only resolves once
+// hardcore-ready arrives, which dispatch() also delivers to a pending call
+// for this reason. Callers must give ctx enough time to cover a full
+// hardcore boot in that case.
+func (c *Client) Start(ctx context.Context, clean bool, requestedBy string) (CommandResult, error) {
+	resp, err := c.call(ctx, message{Type: "start", Clean: clean, RequestedBy: requestedBy})
 	if err != nil {
 		return CommandResult{}, err
 	}
@@ -316,13 +342,33 @@ func (c *Client) Start(ctx context.Context, force bool, requestedBy string) (Com
 	return CommandResult{}, nil
 }
 
-// Load sends a /load request (docs/protocol-gate-manager.md 3.3節). name may be "latest".
+// Load sends a /load request (docs/protocol-gate-manager.md 3.3節). name may
+// be "latest". Like Start, an accepted request against an already-stopped
+// process produces no immediate acknowledgement, so this can resolve via
+// hardcore-ready instead of evacuate-request (see Start's doc comment).
 func (c *Client) Load(ctx context.Context, name string, force bool, requestedBy string) (CommandResult, error) {
 	resp, err := c.call(ctx, message{Type: "load", Name: name, Force: force, RequestedBy: requestedBy})
 	if err != nil {
 		return CommandResult{}, err
 	}
 	if resp.Type == "load-rejected" {
+		return CommandResult{Rejected: true, Reason: resp.Reason}, nil
+	}
+	return CommandResult{}, nil
+}
+
+// Deactivate sends a /deactivate request (docs/protocol-gate-manager.md
+// 3.3a節). It is only ever accepted while the process is running, so an
+// accepted request always yields an evacuate-request before this call
+// resolves (docs/protocol-gate-manager.md 3.5節); the eventual
+// deactivate-complete once the process actually stops is delivered
+// separately via OnDeactivateComplete, not by this call.
+func (c *Client) Deactivate(ctx context.Context, requestedBy string) (CommandResult, error) {
+	resp, err := c.call(ctx, message{Type: "deactivate", RequestedBy: requestedBy})
+	if err != nil {
+		return CommandResult{}, err
+	}
+	if resp.Type == "deactivate-rejected" {
 		return CommandResult{Rejected: true, Reason: resp.Reason}, nil
 	}
 	return CommandResult{}, nil

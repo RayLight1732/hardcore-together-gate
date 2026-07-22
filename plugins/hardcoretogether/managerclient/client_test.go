@@ -73,8 +73,8 @@ func TestStartRejected(t *testing.T) {
 	}
 
 	recv := srv.Received()
-	if len(recv) != 1 || recv[0].Force || recv[0].RequestedBy != "Steve" {
-		t.Fatalf("manager received %+v, want single start{force:false,requestedBy:Steve}", recv)
+	if len(recv) != 1 || recv[0].Clean || recv[0].RequestedBy != "Steve" {
+		t.Fatalf("manager received %+v, want single start{clean:false,requestedBy:Steve}", recv)
 	}
 }
 
@@ -127,8 +127,64 @@ func TestStartAcceptedTriggersEvacuateHandshake(t *testing.T) {
 	}
 
 	recvFirst := srv.Received()[0]
-	if !recvFirst.Force || recvFirst.RequestedBy != "Steve" {
-		t.Fatalf("manager received %+v, want start{force:true,requestedBy:Steve}", recvFirst)
+	if !recvFirst.Clean || recvFirst.RequestedBy != "Steve" {
+		t.Fatalf("manager received %+v, want start{clean:true,requestedBy:Steve}", recvFirst)
+	}
+}
+
+// TestStartAcceptedWithoutEvacuation covers clean:false accepted against an
+// already-stopped process: Manager sends no immediate acknowledgement at
+// all (docs/protocol-gate-manager.md 3.2節), so the call must resolve only
+// once hardcore-ready arrives.
+func TestStartAcceptedWithoutEvacuation(t *testing.T) {
+	srv := mockmanager.Start(t, func(msg mockmanager.Message) []mockmanager.Message {
+		if msg.Type != "start" {
+			return nil
+		}
+		if msg.Clean {
+			t.Errorf("start message had clean=true, want false")
+		}
+		return nil
+	})
+
+	c := newClient(t, srv.Addr)
+
+	type outcome struct {
+		result managerclient.CommandResult
+		err    error
+	}
+	done := make(chan outcome, 1)
+	go func() {
+		result, err := c.Start(context.Background(), false, "Steve")
+		done <- outcome{result, err}
+	}()
+
+	deadline := time.Now().Add(time.Second)
+	for len(srv.Received()) == 0 {
+		if time.Now().After(deadline) {
+			t.Fatal("manager never received start")
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+
+	select {
+	case o := <-done:
+		t.Fatalf("Start returned before hardcore-ready: %+v", o)
+	case <-time.After(100 * time.Millisecond):
+	}
+
+	srv.Push(mockmanager.Message{Type: "hardcore-ready"})
+
+	select {
+	case o := <-done:
+		if o.err != nil {
+			t.Fatalf("Start: %v", o.err)
+		}
+		if o.result.Rejected {
+			t.Fatalf("got rejected result, want acceptance: %+v", o.result)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("Start never resolved after hardcore-ready")
 	}
 }
 
@@ -153,6 +209,80 @@ func TestLoadRejected(t *testing.T) {
 	recv := srv.Received()
 	if len(recv) != 1 || recv[0].Name != "save1" {
 		t.Fatalf("manager received %+v, want single load{name:save1}", recv)
+	}
+}
+
+func TestDeactivateRejected(t *testing.T) {
+	srv := mockmanager.Start(t, func(msg mockmanager.Message) []mockmanager.Message {
+		if msg.Type != "deactivate" {
+			return nil
+		}
+		return []mockmanager.Message{{Type: "deactivate-rejected", Reason: "既に停止しています"}}
+	})
+
+	c := newClient(t, srv.Addr)
+
+	result, err := c.Deactivate(context.Background(), "Steve")
+	if err != nil {
+		t.Fatalf("Deactivate: %v", err)
+	}
+	if !result.Rejected || result.Reason != "既に停止しています" {
+		t.Fatalf("got %+v, want rejected with reason", result)
+	}
+
+	recv := srv.Received()
+	if len(recv) != 1 || recv[0].RequestedBy != "Steve" {
+		t.Fatalf("manager received %+v, want single deactivate{requestedBy:Steve}", recv)
+	}
+}
+
+func TestDeactivateAcceptedTriggersEvacuateHandshake(t *testing.T) {
+	srv := mockmanager.Start(t, func(msg mockmanager.Message) []mockmanager.Message {
+		if msg.Type != "deactivate" {
+			return nil
+		}
+		return []mockmanager.Message{{Type: "evacuate-request", Reason: "deactivate"}}
+	})
+
+	c := newClient(t, srv.Addr)
+
+	evacuated := make(chan string, 1)
+	c.OnEvacuateRequest = func(_ context.Context, reason string) {
+		evacuated <- reason
+	}
+
+	result, err := c.Deactivate(context.Background(), "Steve")
+	if err != nil {
+		t.Fatalf("Deactivate: %v", err)
+	}
+	if result.Rejected {
+		t.Fatalf("got rejected result, want acceptance: %+v", result)
+	}
+
+	select {
+	case reason := <-evacuated:
+		if reason != "deactivate" {
+			t.Fatalf("OnEvacuateRequest reason = %q, want deactivate", reason)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("OnEvacuateRequest was not called")
+	}
+}
+
+func TestDeactivateCompletePush(t *testing.T) {
+	srv := mockmanager.Start(t, func(mockmanager.Message) []mockmanager.Message { return nil })
+
+	c := newClient(t, srv.Addr)
+
+	completed := make(chan struct{}, 1)
+	c.OnDeactivateComplete = func(context.Context) { completed <- struct{}{} }
+
+	srv.Push(mockmanager.Message{Type: "deactivate-complete"})
+
+	select {
+	case <-completed:
+	case <-time.After(time.Second):
+		t.Fatal("OnDeactivateComplete was not called")
 	}
 }
 

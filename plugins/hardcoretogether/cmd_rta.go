@@ -43,6 +43,8 @@ func rtaCommand(d *deps) brigodier.LiteralNodeBuilder {
 			return nil
 		case managerclient.StateStarting:
 			return ctx.Source.SendMessage(infoText("起動処理中です。しばらくお待ちください"))
+		case managerclient.StateStopping:
+			return ctx.Source.SendMessage(infoText("停止処理中です。しばらくお待ちください"))
 		default:
 			return ctx.Source.SendMessage(infoText("hardcoreサーバーは停止中です"))
 		}

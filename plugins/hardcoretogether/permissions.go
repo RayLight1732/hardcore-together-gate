@@ -12,7 +12,7 @@ import (
 )
 
 const (
-	// AdminPermission gates /start, /load (docs/architecture-gate.md 0.2節).
+	// AdminPermission gates /start, /load, /deactivate (docs/architecture-gate.md 0.2節).
 	AdminPermission = "hardcoretogether.admin"
 	// serverCmdPermission is Gate's builtin /server permission node
 	// (docs/architecture-gate.md 0.1節). Admins are granted this too so /server

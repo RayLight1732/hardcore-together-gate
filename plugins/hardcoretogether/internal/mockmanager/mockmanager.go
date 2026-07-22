@@ -19,6 +19,7 @@ type Message struct {
 	Type        string          `json:"type"`
 	State       string          `json:"state,omitempty"`
 	Running     string          `json:"running,omitempty"`
+	Clean       bool            `json:"clean,omitempty"`
 	Force       bool            `json:"force,omitempty"`
 	RequestedBy string          `json:"requestedBy,omitempty"`
 	Name        string          `json:"name,omitempty"`

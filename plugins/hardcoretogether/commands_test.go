@@ -53,18 +53,37 @@ func (f *fakeSource) last() string {
 	return f.messages[len(f.messages)-1]
 }
 
+// waitForMessage polls src.last() until it contains want, since Start/Load/
+// Deactivate now reply immediately and their eventual rejection/completion
+// arrives asynchronously via deps.admin (admin.go).
+func waitForMessage(t *testing.T, src *fakeSource, want string) {
+	t.Helper()
+	deadline := time.Now().Add(time.Second)
+	for {
+		if strings.Contains(src.last(), want) {
+			return
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("last message = %q, want it to contain %q", src.last(), want)
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+}
+
 // newTestDeps connects a managerclient.Client to srv and wraps it in deps
 // with no *proxy.Proxy. This is enough to exercise /start, /load,
-// /savedata and /senpan, which never touch d.proxy directly; /rta, /lobby
-// and the evacuate/transfer callbacks need a real player connection and are
-// out of scope for this test tier.
+// /deactivate, /savedata and /senpan, which never touch d.proxy directly;
+// /rta, /lobby and the evacuate/transfer callbacks need a real player
+// connection and are out of scope for this test tier.
 func newTestDeps(t *testing.T, srv *mockmanager.Server) *deps {
 	t.Helper()
 	client := managerclient.New(srv.Addr, logr.Discard())
 	d := &deps{client: client, log: logr.Discard()}
-	// OnDeactivateComplete never touches d.proxy (unlike OnEvacuateRequest/
-	// OnHardcoreReady), so it's safe to wire up at this test tier.
-	client.OnDeactivateComplete = d.onDeactivateComplete
+	// onAdminRejected/onAdminCompleted never touch d.proxy (unlike
+	// OnEvacuateRequest/OnHardcoreReady), so it's safe to wire them up at
+	// this test tier.
+	client.OnAdminRejected = d.onAdminRejected
+	client.OnAdminCompleted = d.onAdminCompleted
 
 	ctx, cancel := context.WithCancel(context.Background())
 	t.Cleanup(cancel)
@@ -91,6 +110,10 @@ func newTestManager(d *deps) *command.Manager {
 	return mgr
 }
 
+// TestStartCommand_Rejected covers rejection: /start replies immediately
+// with an in-progress notice (it never waits for Manager), so the rejection
+// reason only reaches src asynchronously via deps.admin once start-rejected
+// arrives.
 func TestStartCommand_Rejected(t *testing.T) {
 	srv := mockmanager.Start(t, func(msg mockmanager.Message) []mockmanager.Message {
 		if msg.Type != "start" {
@@ -105,11 +128,12 @@ func TestStartCommand_Rejected(t *testing.T) {
 	if err := mgr.Do(context.Background(), src, "start"); err != nil {
 		t.Fatalf("Do: %v", err)
 	}
-	if src.last() != "挑戦が進行中です" {
-		t.Fatalf("last message = %q, want rejection reason", src.last())
-	}
+	waitForMessage(t, src, "挑戦が進行中です")
 }
 
+// TestStartCommand_CleanAccepted covers /start clean: the command replies
+// immediately, evacuation (if any) happens independently, and the eventual
+// hardcore-ready delivers the completion notice via deps.admin.
 func TestStartCommand_CleanAccepted(t *testing.T) {
 	srv := mockmanager.Start(t, func(msg mockmanager.Message) []mockmanager.Message {
 		if msg.Type != "start" {
@@ -128,14 +152,18 @@ func TestStartCommand_CleanAccepted(t *testing.T) {
 		t.Fatalf("Do: %v", err)
 	}
 	if !strings.Contains(src.last(), "リセット") {
-		t.Fatalf("last message = %q, want an acceptance notice", src.last())
+		t.Fatalf("last message = %q, want an in-progress notice", src.last())
 	}
+
+	srv.Push(mockmanager.Message{Type: "hardcore-ready"})
+	waitForMessage(t, src, "完了")
 }
 
 // TestStartCommand_PlainAccepted covers /start (no clean) against an
 // already-stopped process: Manager accepts with no immediate
-// acknowledgement, so the command only completes once hardcore-ready
-// arrives (docs/protocol-gate-manager.md 3.2節).
+// acknowledgement at all (docs/protocol-gate-manager.md 3.2節), but the
+// command still replies immediately; the completion notice only arrives
+// once hardcore-ready is pushed.
 func TestStartCommand_PlainAccepted(t *testing.T) {
 	srv := mockmanager.Start(t, func(msg mockmanager.Message) []mockmanager.Message {
 		if msg.Type != "start" {
@@ -150,29 +178,15 @@ func TestStartCommand_PlainAccepted(t *testing.T) {
 	mgr := newTestManager(d)
 	src := &fakeSource{allowed: true}
 
-	done := make(chan error, 1)
-	go func() { done <- mgr.Do(context.Background(), src, "start") }()
-
-	deadline := time.Now().Add(time.Second)
-	for len(srv.Received()) == 0 {
-		if time.Now().After(deadline) {
-			t.Fatal("manager never received start")
-		}
-		time.Sleep(5 * time.Millisecond)
-	}
-	srv.Push(mockmanager.Message{Type: "hardcore-ready"})
-
-	select {
-	case err := <-done:
-		if err != nil {
-			t.Fatalf("Do: %v", err)
-		}
-	case <-time.After(time.Second):
-		t.Fatal("command never returned after hardcore-ready")
+	if err := mgr.Do(context.Background(), src, "start"); err != nil {
+		t.Fatalf("Do: %v", err)
 	}
 	if !strings.Contains(src.last(), "起動して") {
-		t.Fatalf("last message = %q, want an acceptance notice", src.last())
+		t.Fatalf("last message = %q, want an in-progress notice", src.last())
 	}
+
+	srv.Push(mockmanager.Message{Type: "hardcore-ready"})
+	waitForMessage(t, src, "完了")
 }
 
 func TestStartCommand_RequiresPermission(t *testing.T) {
@@ -206,9 +220,7 @@ func TestLoadCommand(t *testing.T) {
 	if err := mgr.Do(context.Background(), src, "load latest"); err != nil {
 		t.Fatalf("Do: %v", err)
 	}
-	if src.last() != "アーカイブ latest は存在しません" {
-		t.Fatalf("last message = %q, want rejection reason", src.last())
-	}
+	waitForMessage(t, src, "アーカイブ latest は存在しません")
 }
 
 func TestDeactivateCommand_Rejected(t *testing.T) {
@@ -225,9 +237,7 @@ func TestDeactivateCommand_Rejected(t *testing.T) {
 	if err := mgr.Do(context.Background(), src, "deactivate"); err != nil {
 		t.Fatalf("Do: %v", err)
 	}
-	if src.last() != "既に停止しています" {
-		t.Fatalf("last message = %q, want rejection reason", src.last())
-	}
+	waitForMessage(t, src, "既に停止しています")
 }
 
 func TestDeactivateCommand_RequiresPermission(t *testing.T) {
@@ -245,7 +255,7 @@ func TestDeactivateCommand_RequiresPermission(t *testing.T) {
 }
 
 // TestDeactivateCommand_CompletesAfterEvacuation covers the full accept →
-// evacuate → deactivate-complete flow. onDeactivateComplete never touches
+// evacuate → deactivate-complete flow. onAdminCompleted never touches
 // d.proxy, so unlike evacuate.go/transfer.go's callbacks this is testable
 // at this tier (docs/architecture-gate.md 7.3節).
 func TestDeactivateCommand_CompletesAfterEvacuation(t *testing.T) {
@@ -263,21 +273,11 @@ func TestDeactivateCommand_CompletesAfterEvacuation(t *testing.T) {
 		t.Fatalf("Do: %v", err)
 	}
 	if !strings.Contains(src.last(), "停止しています") {
-		t.Fatalf("last message = %q, want an acceptance notice", src.last())
+		t.Fatalf("last message = %q, want an in-progress notice", src.last())
 	}
 
 	srv.Push(mockmanager.Message{Type: "deactivate-complete"})
-
-	deadline := time.Now().Add(time.Second)
-	for {
-		if strings.Contains(src.last(), "停止しました") {
-			return
-		}
-		if time.Now().After(deadline) {
-			t.Fatalf("last message = %q, want 停止しました after deactivate-complete", src.last())
-		}
-		time.Sleep(5 * time.Millisecond)
-	}
+	waitForMessage(t, src, "停止しました")
 }
 
 func TestSavedataCommand(t *testing.T) {

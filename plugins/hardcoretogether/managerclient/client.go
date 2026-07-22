@@ -72,6 +72,12 @@ type SenpanEntry struct {
 	Count  int       `json:"count"`
 }
 
+// CommandResult is the outcome of a Start or Load call.
+type CommandResult struct {
+	Rejected bool
+	Reason   string
+}
+
 // message is the wire representation of every Gate⇔Manager NDJSON message.
 // A single loosely-typed struct is used because the protocol is small
 // (docs/protocol-gate-manager.md, ~12 message types) and every field maps
@@ -117,31 +123,16 @@ type Client struct {
 	// OnHardcoreReady is called for every hardcore-ready notification
 	// (docs/protocol-gate-manager.md 3.1a節).
 	OnHardcoreReady func(ctx context.Context)
-	// OnAdminRejected is called whenever Manager rejects a Start/Load/
-	// Deactivate request (start-rejected/load-rejected/deactivate-rejected,
-	// docs/protocol-gate-manager.md 3.4節). Those calls return as soon as
-	// the request is sent, so this is the only way rejection reaches Gate.
-	OnAdminRejected func(ctx context.Context, reason string)
-	// OnAdminCompleted is called once an accepted Start/Load/Deactivate
-	// actually finishes: hardcore-ready for Start/Load
-	// (docs/protocol-gate-manager.md 3.1a節), deactivate-complete for
-	// Deactivate (3.5a節). Manager gives no correlation ID, so the caller
-	// is responsible for tracking which command is currently pending.
-	OnAdminCompleted func(ctx context.Context)
+	// OnDeactivateComplete is called for every deactivate-complete
+	// notification (docs/protocol-gate-manager.md 3.5a節).
+	OnDeactivateComplete func(ctx context.Context)
 
 	connMu sync.Mutex
 	conn   net.Conn
 
 	writeMu sync.Mutex
 
-	// callMu/respMu/respCh back the synchronous request/response calls
-	// (QueryState/SaveData/Senpan) that always get an immediate reply. This
-	// is deliberately a separate lane from Start/Load/Deactivate (see
-	// send() calls below), which do not wait for a reply here at all —
-	// otherwise a Start/Load pending on hardcore-ready (which can take as
-	// long as a full server boot) would hold this mutex and block every
-	// other Gate<->Manager exchange, including /rta.
-	callMu sync.Mutex
+	callMu sync.Mutex // serializes synchronous request/response round trips
 	respMu sync.Mutex
 	respCh chan message // set while a call() is outstanding
 }
@@ -214,32 +205,31 @@ func (c *Client) readLoop(conn net.Conn) {
 	}
 }
 
-// dispatch routes an incoming message either to a pending call() on the
-// synchronous lane (state-query/savedata-query/senpan-query — the only
-// messages that ever go through call()) or to one of the push-message
-// callbacks used by everything else: evacuate-request/hardcore-ready
-// (unprompted notifications) and start-rejected/load-rejected/
-// deactivate-rejected/deactivate-complete (asynchronous outcomes of
-// Start/Load/Deactivate, which never wait on this lane — see their doc
-// comments).
+// dispatch routes an incoming message either to a pending call() (the
+// common case: it's a direct response to something Gate just sent) or to
+// the push-message callbacks (evacuate-request, hardcore-ready).
 func (c *Client) dispatch(msg message) {
 	switch msg.Type {
 	case "hardcore-ready":
-		if c.OnAdminCompleted != nil {
-			go c.OnAdminCompleted(context.Background())
-		}
+		// When the target process was already stopped, start/load are
+		// accepted with no other acknowledgement at all (docs/protocol-gate-manager.md
+		// 3.2節) — hardcore-ready is the only signal a pending call() ever
+		// gets in that case, so deliver it in addition to handling it as
+		// the usual push (auto-transfer via OnHardcoreReady).
+		c.deliver(msg)
 		if c.OnHardcoreReady != nil {
 			go c.OnHardcoreReady(context.Background())
 		}
-	case "deactivate-complete":
-		if c.OnAdminCompleted != nil {
-			go c.OnAdminCompleted(context.Background())
-		}
 	case "evacuate-request":
+		// evacuate-request doubles as the "accepted" outcome of a pending
+		// start/load/deactivate call (docs/protocol-gate-manager.md 4節),
+		// so deliver it to any waiting call() in addition to handling it
+		// as a push.
+		c.deliver(msg)
 		go c.handleEvacuateRequest(msg)
-	case "start-rejected", "load-rejected", "deactivate-rejected":
-		if c.OnAdminRejected != nil {
-			go c.OnAdminRejected(context.Background(), msg.Reason)
+	case "deactivate-complete":
+		if c.OnDeactivateComplete != nil {
+			go c.OnDeactivateComplete(context.Background())
 		}
 	default:
 		c.deliver(msg)
@@ -335,38 +325,53 @@ func (c *Client) QueryState(ctx context.Context) (State, Running, error) {
 }
 
 // Start sends a /start [clean] request (docs/protocol-gate-manager.md 3.2節).
-// It returns as soon as the request is sent — Manager gives no synchronous
-// accept/reject reply for start/load/deactivate (only a rejection is ever
-// synchronous, and even that isn't waited for here), so the outcome
-// (rejection via OnAdminRejected, or eventual completion via
-// OnAdminCompleted once hardcore-ready arrives) is always delivered
-// asynchronously. See docs/architecture-gate.md 2.2節.
-func (c *Client) Start(ctx context.Context, clean bool, requestedBy string) error {
-	if err := ctx.Err(); err != nil {
-		return err
+// When clean is false and the target process was already stopped (the only
+// state from which a non-clean start is accepted), Manager sends no
+// immediate acknowledgement at all — the call only resolves once
+// hardcore-ready arrives, which dispatch() also delivers to a pending call
+// for this reason. Callers must give ctx enough time to cover a full
+// hardcore boot in that case.
+func (c *Client) Start(ctx context.Context, clean bool, requestedBy string) (CommandResult, error) {
+	resp, err := c.call(ctx, message{Type: "start", Clean: clean, RequestedBy: requestedBy})
+	if err != nil {
+		return CommandResult{}, err
 	}
-	return c.send(message{Type: "start", Clean: clean, RequestedBy: requestedBy})
+	if resp.Type == "start-rejected" {
+		return CommandResult{Rejected: true, Reason: resp.Reason}, nil
+	}
+	return CommandResult{}, nil
 }
 
 // Load sends a /load request (docs/protocol-gate-manager.md 3.3節). name may
-// be "latest". Like Start, it only sends the request; the outcome arrives
-// later via OnAdminRejected/OnAdminCompleted.
-func (c *Client) Load(ctx context.Context, name string, force bool, requestedBy string) error {
-	if err := ctx.Err(); err != nil {
-		return err
+// be "latest". Like Start, an accepted request against an already-stopped
+// process produces no immediate acknowledgement, so this can resolve via
+// hardcore-ready instead of evacuate-request (see Start's doc comment).
+func (c *Client) Load(ctx context.Context, name string, force bool, requestedBy string) (CommandResult, error) {
+	resp, err := c.call(ctx, message{Type: "load", Name: name, Force: force, RequestedBy: requestedBy})
+	if err != nil {
+		return CommandResult{}, err
 	}
-	return c.send(message{Type: "load", Name: name, Force: force, RequestedBy: requestedBy})
+	if resp.Type == "load-rejected" {
+		return CommandResult{Rejected: true, Reason: resp.Reason}, nil
+	}
+	return CommandResult{}, nil
 }
 
 // Deactivate sends a /deactivate request (docs/protocol-gate-manager.md
-// 3.3a節). Like Start/Load, it only sends the request; rejection or the
-// eventual deactivate-complete arrives later via OnAdminRejected/
-// OnAdminCompleted.
-func (c *Client) Deactivate(ctx context.Context, requestedBy string) error {
-	if err := ctx.Err(); err != nil {
-		return err
+// 3.3a節). It is only ever accepted while the process is running, so an
+// accepted request always yields an evacuate-request before this call
+// resolves (docs/protocol-gate-manager.md 3.5節); the eventual
+// deactivate-complete once the process actually stops is delivered
+// separately via OnDeactivateComplete, not by this call.
+func (c *Client) Deactivate(ctx context.Context, requestedBy string) (CommandResult, error) {
+	resp, err := c.call(ctx, message{Type: "deactivate", RequestedBy: requestedBy})
+	if err != nil {
+		return CommandResult{}, err
 	}
-	return c.send(message{Type: "deactivate", RequestedBy: requestedBy})
+	if resp.Type == "deactivate-rejected" {
+		return CommandResult{Rejected: true, Reason: resp.Reason}, nil
+	}
+	return CommandResult{}, nil
 }
 
 // SaveData requests the /savedata listing (docs/protocol-gate-manager.md 3.6節).

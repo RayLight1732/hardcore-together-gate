@@ -43,7 +43,8 @@ var Plugin = proxy.Plugin{
 
 		client.OnEvacuateRequest = d.onEvacuateRequest
 		client.OnHardcoreReady = d.onHardcoreReady
-		client.OnDeactivateComplete = d.onDeactivateComplete
+		client.OnAdminRejected = d.onAdminRejected
+		client.OnAdminCompleted = d.onAdminCompleted
 		go client.Run(ctx)
 
 		registerPermissions(p, admins)
@@ -70,5 +71,5 @@ type deps struct {
 	lobbyServer    string
 	hardcoreServer string
 
-	deactivate deactivateState
+	admin adminState
 }

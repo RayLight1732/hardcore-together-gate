@@ -64,12 +64,20 @@ func TestStartRejected(t *testing.T) {
 
 	c := newClient(t, srv.Addr)
 
-	result, err := c.Start(context.Background(), false, "Steve")
-	if err != nil {
+	rejected := make(chan string, 1)
+	c.OnAdminRejected = func(_ context.Context, reason string) { rejected <- reason }
+
+	if err := c.Start(context.Background(), false, "Steve"); err != nil {
 		t.Fatalf("Start: %v", err)
 	}
-	if !result.Rejected || result.Reason != "挑戦が進行中です" {
-		t.Fatalf("got %+v, want rejected with reason", result)
+
+	select {
+	case reason := <-rejected:
+		if reason != "挑戦が進行中です" {
+			t.Fatalf("OnAdminRejected reason = %q, want 挑戦が進行中です", reason)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("OnAdminRejected was not called")
 	}
 
 	recv := srv.Received()
@@ -78,6 +86,10 @@ func TestStartRejected(t *testing.T) {
 	}
 }
 
+// TestStartAcceptedTriggersEvacuateHandshake covers clean:true accepted
+// against a running process: Start returns as soon as the request is sent
+// (it never waits for Manager's reply), and the evacuate handshake happens
+// independently via OnEvacuateRequest.
 func TestStartAcceptedTriggersEvacuateHandshake(t *testing.T) {
 	srv := mockmanager.Start(t, func(msg mockmanager.Message) []mockmanager.Message {
 		if msg.Type != "start" {
@@ -93,12 +105,8 @@ func TestStartAcceptedTriggersEvacuateHandshake(t *testing.T) {
 		evacuated <- reason
 	}
 
-	result, err := c.Start(context.Background(), true, "Steve")
-	if err != nil {
+	if err := c.Start(context.Background(), true, "Steve"); err != nil {
 		t.Fatalf("Start: %v", err)
-	}
-	if result.Rejected {
-		t.Fatalf("got rejected result, want acceptance: %+v", result)
 	}
 
 	select {
@@ -132,11 +140,13 @@ func TestStartAcceptedTriggersEvacuateHandshake(t *testing.T) {
 	}
 }
 
-// TestStartAcceptedWithoutEvacuation covers clean:false accepted against an
-// already-stopped process: Manager sends no immediate acknowledgement at
-// all (docs/protocol-gate-manager.md 3.2節), so the call must resolve only
-// once hardcore-ready arrives.
-func TestStartAcceptedWithoutEvacuation(t *testing.T) {
+// TestAdminCompletedOnHardcoreReady covers the case where Start/Load are
+// accepted against an already-stopped process: Manager sends no immediate
+// acknowledgement at all (docs/protocol-gate-manager.md 3.2節), so
+// hardcore-ready is the only signal that ever arrives, and it must reach
+// both OnAdminCompleted (the pending command's own completion notice) and
+// OnHardcoreReady (the lobby-wide auto-transfer) independently.
+func TestAdminCompletedOnHardcoreReady(t *testing.T) {
 	srv := mockmanager.Start(t, func(msg mockmanager.Message) []mockmanager.Message {
 		if msg.Type != "start" {
 			return nil
@@ -149,15 +159,14 @@ func TestStartAcceptedWithoutEvacuation(t *testing.T) {
 
 	c := newClient(t, srv.Addr)
 
-	type outcome struct {
-		result managerclient.CommandResult
-		err    error
+	completed := make(chan struct{}, 1)
+	ready := make(chan struct{}, 1)
+	c.OnAdminCompleted = func(context.Context) { completed <- struct{}{} }
+	c.OnHardcoreReady = func(context.Context) { ready <- struct{}{} }
+
+	if err := c.Start(context.Background(), false, "Steve"); err != nil {
+		t.Fatalf("Start: %v", err)
 	}
-	done := make(chan outcome, 1)
-	go func() {
-		result, err := c.Start(context.Background(), false, "Steve")
-		done <- outcome{result, err}
-	}()
 
 	deadline := time.Now().Add(time.Second)
 	for len(srv.Received()) == 0 {
@@ -167,24 +176,52 @@ func TestStartAcceptedWithoutEvacuation(t *testing.T) {
 		time.Sleep(5 * time.Millisecond)
 	}
 
-	select {
-	case o := <-done:
-		t.Fatalf("Start returned before hardcore-ready: %+v", o)
-	case <-time.After(100 * time.Millisecond):
-	}
-
 	srv.Push(mockmanager.Message{Type: "hardcore-ready"})
 
 	select {
-	case o := <-done:
-		if o.err != nil {
-			t.Fatalf("Start: %v", o.err)
-		}
-		if o.result.Rejected {
-			t.Fatalf("got rejected result, want acceptance: %+v", o.result)
-		}
+	case <-completed:
 	case <-time.After(time.Second):
-		t.Fatal("Start never resolved after hardcore-ready")
+		t.Fatal("OnAdminCompleted was not called")
+	}
+	select {
+	case <-ready:
+	case <-time.After(time.Second):
+		t.Fatal("OnHardcoreReady was not called")
+	}
+}
+
+// TestQueryStateNotBlockedByPendingAdminOp guards against a regression: an
+// accepted Start/Load against an already-stopped process can stay pending
+// until hardcore fully boots (docs/protocol-gate-manager.md 3.2節), and that
+// must never block unrelated synchronous calls like /rta's QueryState,
+// which players naturally keep using while waiting for the server to come
+// up.
+func TestQueryStateNotBlockedByPendingAdminOp(t *testing.T) {
+	srv := mockmanager.Start(t, func(msg mockmanager.Message) []mockmanager.Message {
+		switch msg.Type {
+		case "state-query":
+			return []mockmanager.Message{{Type: "state-response", State: "starting", Running: "true"}}
+		default:
+			// No reply to "start": simulates hardcore still booting, with
+			// no hardcore-ready pushed for the lifetime of this test.
+			return nil
+		}
+	})
+
+	c := newClient(t, srv.Addr)
+
+	if err := c.Start(context.Background(), false, "Steve"); err != nil {
+		t.Fatalf("Start: %v", err)
+	}
+
+	qctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+	state, _, err := c.QueryState(qctx)
+	if err != nil {
+		t.Fatalf("QueryState: %v", err)
+	}
+	if state != managerclient.StateStarting {
+		t.Fatalf("state = %q, want starting", state)
 	}
 }
 
@@ -198,12 +235,20 @@ func TestLoadRejected(t *testing.T) {
 
 	c := newClient(t, srv.Addr)
 
-	result, err := c.Load(context.Background(), "save1", false, "Steve")
-	if err != nil {
+	rejected := make(chan string, 1)
+	c.OnAdminRejected = func(_ context.Context, reason string) { rejected <- reason }
+
+	if err := c.Load(context.Background(), "save1", false, "Steve"); err != nil {
 		t.Fatalf("Load: %v", err)
 	}
-	if !result.Rejected || result.Reason != "アーカイブ save1 は存在しません" {
-		t.Fatalf("got %+v, want rejected with reason", result)
+
+	select {
+	case reason := <-rejected:
+		if reason != "アーカイブ save1 は存在しません" {
+			t.Fatalf("OnAdminRejected reason = %q, want アーカイブ save1 は存在しません", reason)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("OnAdminRejected was not called")
 	}
 
 	recv := srv.Received()
@@ -222,12 +267,20 @@ func TestDeactivateRejected(t *testing.T) {
 
 	c := newClient(t, srv.Addr)
 
-	result, err := c.Deactivate(context.Background(), "Steve")
-	if err != nil {
+	rejected := make(chan string, 1)
+	c.OnAdminRejected = func(_ context.Context, reason string) { rejected <- reason }
+
+	if err := c.Deactivate(context.Background(), "Steve"); err != nil {
 		t.Fatalf("Deactivate: %v", err)
 	}
-	if !result.Rejected || result.Reason != "既に停止しています" {
-		t.Fatalf("got %+v, want rejected with reason", result)
+
+	select {
+	case reason := <-rejected:
+		if reason != "既に停止しています" {
+			t.Fatalf("OnAdminRejected reason = %q, want 既に停止しています", reason)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("OnAdminRejected was not called")
 	}
 
 	recv := srv.Received()
@@ -251,12 +304,8 @@ func TestDeactivateAcceptedTriggersEvacuateHandshake(t *testing.T) {
 		evacuated <- reason
 	}
 
-	result, err := c.Deactivate(context.Background(), "Steve")
-	if err != nil {
+	if err := c.Deactivate(context.Background(), "Steve"); err != nil {
 		t.Fatalf("Deactivate: %v", err)
-	}
-	if result.Rejected {
-		t.Fatalf("got rejected result, want acceptance: %+v", result)
 	}
 
 	select {
@@ -275,14 +324,14 @@ func TestDeactivateCompletePush(t *testing.T) {
 	c := newClient(t, srv.Addr)
 
 	completed := make(chan struct{}, 1)
-	c.OnDeactivateComplete = func(context.Context) { completed <- struct{}{} }
+	c.OnAdminCompleted = func(context.Context) { completed <- struct{}{} }
 
 	srv.Push(mockmanager.Message{Type: "deactivate-complete"})
 
 	select {
 	case <-completed:
 	case <-time.After(time.Second):
-		t.Fatal("OnDeactivateComplete was not called")
+		t.Fatal("OnAdminCompleted was not called")
 	}
 }
 

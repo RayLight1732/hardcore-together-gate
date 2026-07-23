@@ -125,7 +125,7 @@ Manager → Gate。要求を拒否した場合の応答。
 | フィールド | 型 | 必須 | 説明 |
 |---|---|---|---|
 | `type` | string | ✓ | `"start-rejected"` \| `"load-rejected"` \| `"deactivate-rejected"` |
-| `reason` | string | ✓ | 拒否理由（例：`"既に起動しています"`、`"ワールドが存在しません"`、`"挑戦が進行中です"`、`"アーカイブ<name>は存在しません"`、`"既に停止しています"`） |
+| `reason` | string | ✓ | 拒否理由（例：`"既に起動しています"`、`"挑戦が進行中です"`、`"アーカイブ<name>は存在しません"`、`"既に停止しています"`、`"処理中です。しばらくお待ちください"`） |
 
 ```json
 {"type":"load-rejected","reason":"アーカイブ save1 は存在しません"}
@@ -134,7 +134,7 @@ Manager → Gate。要求を拒否した場合の応答。
 {"type":"start-rejected","reason":"既に起動しています"}
 ```
 
-`start-rejected`は`clean:false`の場合のみ発生しうる（`clean:true`は常に受理される）。理由は2種類：「既に起動しています」（プロセスが既に起動中/起動処理中）・「ワールドが存在しません」（`world/`が無く、`/start clean`か`/load`が必要）。`start-rejected`・`deactivate-rejected`は`force`の概念を持たない（`specification.md` 2.1節「`force`の適用範囲」参照）——プロセス状態の矛盾（既に起動中/停止中）を免除する操作はそもそも存在しない。
+`start-rejected`（`clean:false`時）の理由は2種類：「既に起動しています」（`phase==ready`）・「処理中です。しばらくお待ちください」（`phase==starting`/`stopping`の遷移中）。`world/`の有無は判定に使わないため、「ワールドが存在しません」という拒否理由は存在しない——`world/`が無ければ単に新規作成してから起動する（3.2節`start`の`clean`フィールド説明、`specification.md` 2.1節）。`clean:true`は`running`に関する拒否分岐を持たないが、遷移中であれば同じく「処理中です」で拒否されうる（`clean:false`と共通のガード）。`start-rejected`・`deactivate-rejected`は`force`の概念を持たない（`specification.md` 2.1節「`force`の適用範囲」参照）——プロセス状態の矛盾（既に起動中/停止中）・遷移中であることを免除する操作はそもそも存在しない。
 
 ### 3.5 `evacuate-request` / `evacuate-complete`
 
@@ -225,7 +225,7 @@ sequenceDiagram
     P->>G: /start clean
     G->>G: 権限チェック
     G->>M: {"type":"start","clean":true,...}
-    Note over M: clean:trueは常に受理される（拒否分岐無し）
+    Note over M: clean:trueにrunningによる拒否分岐は無いが、遷移中（starting/stopping）なら他コマンドと同様start-rejected「処理中です」で拒否されうる
     M->>G: {"type":"evacuate-request","reason":"..."}
     G->>G: hardcore接続中の全プレイヤーをlobbyへ強制転送（プロセス停止中なら不要）
     G->>M: {"type":"evacuate-complete"}
@@ -279,11 +279,11 @@ sequenceDiagram
     P->>G: /start
     G->>G: 権限チェック
     G->>M: {"type":"start","clean":false,"requestedBy":"..."}
-    alt 既に起動中/起動処理中、またはワールドが存在しない（拒否）
+    alt 既に起動中/遷移中（拒否）
         M->>G: {"type":"start-rejected","reason":"..."}
         G->>P: 拒否理由を表示
     else 受理
-        M->>H: プロセス起動（ワールドには触れない）
+        M->>H: プロセス起動（world/が無ければ新規作成、あれば触れない）
         H->>M: {"type":"ready","running":...}  (別プロトコル: mod-manager)
         M->>G: {"type":"hardcore-ready"}
         G->>G: lobby接続中の全プレイヤーをhardcoreへ自動接続

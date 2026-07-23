@@ -4,7 +4,7 @@
 
 **実装済み**：`go build ./...`・`go vet ./...`・`go test ./... -race`がすべて通り、実バイナリを起動してGate役・MOD役のTCPクライアントで`/start`・`/load`・アーカイブ・SIGTERM終了までエンドツーエンドに動作確認済み。当初はGo標準の機能パッケージ分割（`state`/`process`/`archive`/`records`/`modserver`/`gateserver`/`orchestrator`）で実装したが、その後**レイヤードアーキテクチャ（domain/port/application/adapter）へ再構成した**。兄弟リポジトリ`hardcore-together-neoforge`が`domain`・`port.ChallengeState`・`ChallengeApplicationService`・`adapter/neoforge`というポート&アダプタ（ヘキサゴナル）構成を採っているため、用語・構成をそちらに揃えている（1節参照）。
 
-**未実装（設計のみ）**：変更履歴末尾の「初回`/start`が永遠に成功しないデッドロックを修正」（`running`の永続化＝`adapter/memstate`→`adapter/fsstate`、`/start`の`clean`修飾子・`/deactivate`＝8a節）は、上記の`実装済み`時点のコードにはまだ反映されていない設計変更。実装時は`go test ./... -race`・実バイナリE2Eの再確認が必要（13節に回帰テスト案を追記済み）。
+**実装済み（デッドロック修正・`/deactivate`）**：変更履歴の「初回`/start`が永遠に成功しないデッドロックを修正」（`running`の永続化＝`adapter/memstate`→`adapter/fsstate`、`/start`の`clean`修飾子・`/deactivate`＝8a節）・「孤児プロセス対策としてPIDファイルによる生存確認を追加」（3節）は実装済み。`go test ./... -race`・実バイナリE2E（13節の回帰テスト含む）で確認済み。実装中にdocker compose上での手動確認で見つかった追加のバグ（`/start`（`clean`無し）が`world/`未生成を誤って拒否していた）も修正済み——詳細は変更履歴末尾を参照。
 
 Gate⇔Manager間・MOD⇔Manager間プロトコルの詳細（メッセージのフィールド定義・JSON例・シーケンス図）は`docs/protocol-gate-manager.md`・`docs/protocol-mod-manager.md`が正であり、本ドキュメントでは重複させず参照するに留める。
 
@@ -92,13 +92,13 @@ Managerが内部で持つ状態は2つで、常にペアで扱う（仕様書3.1
 | `Running` | `true` \| `false` \| `unknown` | 挑戦が進行中かどうかの値。hardcore MODからの`ready`/`running-changed`で更新され、**Manager自身のローカルディスクへ永続化される**（後述） |
 
 **レイヤーごとの役割分担**：
-- `domain/challenge`：`Phase`/`Running`/`Snapshot`型と、`DecideStart(current Running, force bool) (ok bool, reason string)`という**純粋な**許可判定ルールのみを持つ。I/Oも排他制御も知らない
-- `port.ChallengeStateRepository`：`Snapshot()`・`TryMarkStarting(force bool) (bool, string)`・`TryMarkResuming() (bool, string)`・`TryMarkDeactivating() (bool, string)`・`MarkReady`・`SetRunning`・`MarkUnknown`・`MarkStopped`・`Restore(State)`というインターフェース定義のみ。`TryMarkResuming`は`start{clean:false}`専用の判定（`running`を一切見ず、`phase==stopped`かどうかだけを見る。8a節）
+- `domain/challenge`：`Phase`/`Running`/`Snapshot`型と、`DecideStart(phase Phase, current Running, force bool) (ok bool, reason string)`という**純粋な**許可判定ルールのみを持つ。`phase`が`starting`/`stopping`（遷移中）の場合は`force`の値に関わらず「処理中です」で拒否するガードを`running`チェックより先に持つ（仕様書2.1節「起動処理中・停止処理中」の一律拒否ルール。`clean:true`もこのガードの対象——後述）。同様に`DecideResume(phase Phase)`（`start{clean:false}`用）・`DecideDeactivate(phase Phase)`（`deactivate`用）も持つ。I/Oも排他制御も知らない
+- `port.ChallengeStateRepository`：`Snapshot()`・`TryMarkStarting(force bool) (bool, string)`・`TryMarkResuming() (bool, string)`・`TryMarkDeactivating() (bool, string)`・`MarkReady`・`SetRunning`・`MarkUnknown`・`MarkStopped`・`MarkDeactivated`・`Restore(State)`というインターフェース定義のみ。`TryMarkResuming`は`start{clean:false}`専用の判定（`running`を一切見ず、`phase==stopped`かどうかだけを見る。8a節）。`MarkDeactivated`は`MarkStopped`と異なり`phase`のみを`stopped`に戻し`running`は変更しない（`deactivate`の成功パス・`start{clean:false}`のプロセス起動失敗パス専用、8a節）
 - `adapter/fsstate.Repository`（**旧`adapter/memstate`から改名**、後述「`running`の永続化」）：上記portの実装。1つの`sync.RWMutex`で`{phase, running}`のタプルを保護し、`TryMarkStarting`/`TryMarkResuming`/`TryMarkDeactivating`内部で判定ロジックを呼びつつ、許可された場合の状態遷移コミットまでを**同一ロック内でアトミックに**行う（フィールドを直接触らせない）
 
 `DecideStart`（判定ルール）と`TryMarkStarting`（判定＋コミットのアトミックな実行）をあえて分けている理由：判定ロジック自体は`adapter/fsstate`のテストとは独立に`domain/challenge`単体でユニットテストでき（ロック・並行性の心配が要らない）、一方で「判定してからコミットするまでの間に割り込まれない」という排他性の保証はport実装（adapter）側の責務として残せるため。
 
-- `phase`が`starting`の間は、MOD⇔Manager接続がまだ確立していない（新プロセスがこれから`ready`を送ってくる）ため、この間の`running`は自然と`unknown`になる。**これにより「起動処理中に別の`/start`が来たらどうするか」を専用のロックで排他する必要が無い**——`running=unknown`は拒否対象なので、2件目の`/start`はrunningチェックだけで自動的に弾かれる（`force`指定時は別、8節参照）
+- `phase`が`starting`/`stopping`の間（起動処理中・停止処理中）は、`DecideStart`/`DecideResume`/`DecideDeactivate`いずれも`force`/`clean`の値に関わらず「処理中です」で一律拒否する（前述）。**これにより「処理中に別の`/start`・`/load`・`/deactivate`が来たらどうするか」を専用のロックで排他する必要が無い**——`phase`そのものを見て自動的に弾かれるため、`clean:true`・`force:true`のような`running`チェックを免除する指定でも素通りしない（12節）
 
 ### `running`の永続化とデッドロックの修正
 
@@ -108,7 +108,7 @@ Managerが内部で持つ状態は2つで、常にペアで扱う（仕様書3.1
 
 - `SetRunning(running bool)`・`MarkReady(running bool)`が呼ばれるたび、`{"running": <bool>}`のような小さなJSONファイル（パスは`config.yml`で指定、9節）へ同期的に書き込む。`MarkUnknown()`はディスクへは書かない（`unknown`は「プロセスは生きているがMOD接続だけが切れている」という、Manager自身の現在の生存プロセスに紐づく一時的な状態であり、Manager再起動後は`phase`がどのみち`stopped`にリセットされる以上、意味を持たないため）
 - Manager起動時、`adapter/fsstate.New(...)`はこの永続化ファイルを読み込む：**存在すれば**その`running`値を初期値として使う（Manager自身が再起動しても、直前の挑戦状態を失わない）。**存在しなければ**（一度も`/start`・`/load`が成功したことが無い、真新しいデプロイ）`running=false`で初期化する——`unknown`ではない。`phase`は常に`stopped`で初期化する（Manager再起動時、`os/exec`の子プロセスは道連れで死んだものとして扱い、生存中の子プロセスへの再アタッチはサポートしない。旧14節未確定事項6の結論、後述）。**ただしこの「道連れで死ぬ」という前提は、Managerへ`SIGTERM`が届く通常の再起動（Docker再起動等）でしか保証されない**——Manager自体がpanic・OOM Kill・`SIGKILL`で即死した場合はグレースフルシャットダウン処理が一切走らず、hardcoreプロセスが孤児として生き残ったまま新しいManagerが`phase=stopped`で起動しうる。この状態を放置すると、次の`/start`（`clean`無し）が「動いていない」と誤認して**同じ`world/`・同じポートへ向けて二重にプロセスを起動する**危険がある。この危険を防ぐため、Manager起動時に**PIDファイルによる生存確認**を行う（詳細は3節）
-- 「永続化ファイルが存在しない」＝「一度も`/start`・`/load`が成功していない」であり、`world/`ディレクトリの存在ともほぼ同義になる（両者は`Start`/`Load`の成功時に同時に作られるため）。`start{clean:false}`が「ワールドが存在しません」を判定する際は、この永続化ファイルの有無ではなく`port.WorldPreparer.Exists()`（3節）による`world/`ディレクトリの直接確認を使う——ワールドの実体そのものを確認する方が、間接的な代理指標（永続化ファイルの有無）より確実なため。なお`start{clean:false}`自身は`running`値を全く参照しない（`TryMarkResuming`は`phase`のみを見る）ため、この永続化はもっぱら`/load`の`running`チェックのために必要になる
+- 「永続化ファイルが存在しない」＝「一度も`/start`・`/load`が成功していない」であり、`world/`ディレクトリの存在ともほぼ同義になる（両者は`Start`/`Load`の成功時に同時に作られるため）。ただし`start{clean:false}`は`world/`の有無を一切判定に使わない（後述：無ければ単にプロセス起動時に新規作成されるだけで、拒否はしない、仕様書2.1節）ため、この永続化はもっぱら`/load`の`running`チェックの正確性のために必要になる（`TryMarkResuming`は`phase`のみを見るため`running`永続化に依存しない）
 
 この変更により、`unknown`（安全側で`true`扱い）は「プロセスは生きているのにMOD接続だけが切れている」というまれな異常系にのみ発生するようになり、一度も起動したことが無い状態からの`/start`が阻まれることは無くなった。
 
@@ -122,7 +122,7 @@ Managerが内部で持つ状態は2つで、常にペアで扱う（仕様書3.1
 - **hardcoreモード・難易度HARDの固定方法**：バニラサーバーは`server.properties`の`hardcore=true`を新規ワールド生成時に読むと、そのワールドをハードコアモード（難易度HARD固定・死亡でスペクテイター送り）で生成する、という標準機能を持つ（NeoForgeもこれをそのまま継承しており、MOD側でランタイムに`setHardcore`を呼ぶ必要はない）。同様に`level-seed`を空にしておけば、新規生成のたびにランダムなシードが使われる。つまり**「テンプレートに焼き込む」必要は無く、`hardcore/`作業ディレクトリに置く`server.properties`で`hardcore=true`・`level-seed=`（空）にしておくだけで、仕様書5.3節の要件（ランタイムでの`setHardcore`相当APIが無い制約下でのhardcore固定）とユーザーが望む「シードは都度やり直す」の両方を満たせる
 - **Managerによる`server.properties`の保証**：`server.properties`自体は`world/`の外にあり`/start`のワイプ対象ではない（仕様書11節）ため、通常は初期セットアップ時に設定した値がそのまま残り続ける想定だが、手動編集等で`hardcore=true`が意図せず外れる事故を防ぐため、Managerは`/start`時に`world/`を削除する前後で`server.properties`の`hardcore=true`を読み取り検証し、`false`になっていた場合は書き戻す（`level-seed`は明示的に空へ強制はしない——運用上あえて固定シードでテストしたいケースを妨げないため。デフォルトで空にしておく運用は初期セットアップ側の責務とする）
 - **`records/`はワイプ対象に含めない**：`world/`と同階層だが別ディレクトリなので、`world/`削除処理は`records/`に触れない（仕様書11節の table通り）
-- **`Exists() (bool, error)`**：`world/`ディレクトリの存在を確認するだけの薄いメソッド。`port.WorldPreparer`に追加した（8a節の`start{clean:false}`が「ワールドが存在しません」を判定するために使う）。`WipeWorld`・`EnsureHardcoreMode`と異なり判定のみで副作用を持たない
+- **`Exists() (bool, error)`**：`world/`ディレクトリの存在を確認するだけの薄いメソッド。`port.WorldPreparer`に定義されている。**当初`start{clean:false}`が「ワールドが存在しません」で拒否するために使う設計だったが、これは仕様書2.1節の状態別挙動表（状態①：`world/`が無ければ拒否ではなく新規作成して起動）と矛盾する誤りだったため、`application`層からの呼び出しは削除した**（変更履歴末尾参照）。`world/`が無い場合の新規作成は、Manager側が事前にチェックするのではなく、`process.Start()`でhardcore自身を起動した際にNeoForge側が自然に行う（3節「ワールドの新規生成」）
 
 ### PIDファイルによる孤児プロセス検知（`adapter/osprocess`）
 
@@ -207,7 +207,7 @@ Gate側は起動時に接続しにくるクライアントであり、Managerは
 
 仕様書7.3節のフローをそのままコードへ落とし込む中心コンポーネント。レイヤードアーキテクチャ化に伴い、旧`orchestrator`パッケージの内容はここへ移った。`opMutex`もこの構造体に内包され（`sync.Mutex`、外部と共有する`*sync.Mutex`ではない）、`Start`・`Load`・`HandleArchiveRequest`（6節）が同じインスタンスの同じロックを使う。
 
-**実装時に、当初の疑似コード（後述）にあった手順の順序を1点修正した**：opMutexをrunningチェックより先に獲得する案だと、先発の`/start`がシーケンス全体（退避待ち〜再起動〜ready待ち、最大で数十秒〜数分）の間opMutexを握り続けるため、後発の`/start`はrunningチェックにたどり着く前にopMutex獲得待ちで長時間ブロックされてしまう。これは2節の「起動処理中は`running=unknown`が自然と2件目の`/start`を弾く（＝即座に拒否される）」という説明と矛盾する。そこで、`ChallengeStateRepository.TryMarkStarting`（2節、ロック不要のアトミックな検査兼コミット）を**先に**実行し、opMutexはその後、実際にファイル/プロセスへ触れる直前でのみ獲得する順序に改めた：
+**実装時に、当初の疑似コード（後述）にあった手順の順序を1点修正した**：opMutexをrunningチェックより先に獲得する案だと、先発の`/start`がシーケンス全体（退避待ち〜再起動〜ready待ち、最大で数十秒〜数分）の間opMutexを握り続けるため、後発の`/start`はrunningチェックにたどり着く前にopMutex獲得待ちで長時間ブロックされてしまう。これは2節の「`DecideStart`自身の遷移中ガードが2件目の`/start`を即座に弾く」という説明と矛盾する。そこで、`ChallengeStateRepository.TryMarkStarting`（2節、ロック不要のアトミックな検査兼コミット）を**先に**実行し、opMutexはその後、実際にファイル/プロセスへ触れる直前でのみ獲得する順序に改めた：
 
 `Start`は`clean`フラグで2つの経路に分岐する。`clean==true`のときの経路は以下の通り（`clean==false`の経路は8a節）：
 
@@ -217,10 +217,13 @@ Start(ctx, clean bool, requestedBy string) error:
 
   // clean==true
   1. prior := state.Snapshot()（失敗時のロールバック用に退避）
-  2. state.TryMarkStarting(force=true)（常に受理される。`clean`はrunningチェックを常に
-     免除するため、実質「force固定」と同じ意味になる。ここはopMutex不要）
+  2. state.TryMarkStarting(force=true)（`clean`はrunningチェックを常に免除するため、
+     実質「force固定」と同じ意味になる。ただしphaseが遷移中〈starting/stopping〉なら
+     forceでも拒否される〈domain/challenge.DecideStartの遷移中ガード、2節〉。
+     ここはopMutex不要）
   3. opMutex.Lock() → defer Unlock()
-  4. reason := prior.Running==true の場合 "force-reset"、それ以外 "reset"
+  4. reason := "force-reset"（`docs/protocol-gate-manager.md` 3.5節：`start`のclean:trueは
+     常にforce-reset固定。`prior.Running`の値では分岐しない——`load`のforce:trueとはここが異なる）
      port.GateNotifier経由で evacuate-request(reason) 送信（その時点でphase!=stoppedの場合のみ。
      stoppedなら手順4〜5は省略し手順5aへ）
      → evacuate-complete受信までブロック（タイムアウト付き、14節）
@@ -249,26 +252,28 @@ Start(ctx, clean bool, requestedBy string) error:
 
 ## 8a. `Start`（`clean:false`）・`Deactivate`の実装（`application.ChallengeApplicationService`）
 
-`specification.md` 2.1節・7.4節で定義した`/start`（`clean`無し）・`/deactivate`の実装。`Start`（`clean:true`、8節）・`Load`が内部で行っている「プロセス起動」手順の後半を、ワールド操作（新規作成・復元）を伴わない単独の経路として切り出したものであり、`adapter/osprocess.Runner`（3節）・`port.GateNotifier`・`port.ReadyWaiter`は共有する（新規のI/Oアダプタは追加しない。新規に必要なのは2節の`TryMarkResuming`/`TryMarkDeactivating`と3節の`WorldPreparer.Exists()`のみ）。
+`specification.md` 2.1節・7.4節で定義した`/start`（`clean`無し）・`/deactivate`の実装。`Start`（`clean:true`、8節）・`Load`が内部で行っている「プロセス起動」手順の後半を、ワールド操作（新規作成・復元）を伴わない単独の経路として切り出したものであり、`adapter/osprocess.Runner`（3節）・`port.GateNotifier`・`port.ReadyWaiter`は共有する（新規のI/Oアダプタは追加しない。新規に必要なのは2節の`TryMarkResuming`/`TryMarkDeactivating`/`MarkDeactivated`のみ）。
+
+`start{clean:false}`は`world/`の有無を一切判定に使わない点に注意（3節「`Exists()`」参照：当初はここで`world.Exists()`を呼び「ワールドが存在しません」で拒否する設計だったが、仕様書2.1節の状態別挙動表（状態①）と矛盾する誤りだったため削除した）。`world/`が無ければ、手順3の`process.Start()`でhardcoreプロセス自身が新規ワールドを生成するだけで、Manager側の拒否分岐は無い。
 
 ```
 Start(ctx, clean=false, requestedBy string) error:
-  1. exists, err := world.Exists()（3節、port.WorldPreparer）
-     !exists なら port.GateNotifier経由で start-rejected("ワールドが存在しません") を送って終了
-  2. ok, reason := state.TryMarkResuming()（2節。phaseがstoppedでない場合のみ拒否
-     "既に起動しています"——世界の存在チェックとは別の理由なので、手順1と2は独立した
-     2つの拒否理由を返しうる。**runningは一切参照しない**）
+  1. ok, reason := state.TryMarkResuming()（2節。phase!=stoppedの場合のみ拒否——
+     「既に起動しています」〈phase==ready〉・「処理中です」〈phase==starting/stopping〉のいずれか。
+     **runningは一切参照しない**）
      ok==false なら start-rejected(reason) を送って終了
-  3. opMutex.Lock() → defer Unlock()（Start(clean=true)/Loadと同じロックを使う。3節のプロセス操作
+  2. opMutex.Lock() → defer Unlock()（Start(clean=true)/Loadと同じロックを使う。3節のプロセス操作
      を保護するという意味では一貫しているが、対象状態は常にphase==stoppedのはずなのでStart/Load
      のアーカイブコピーと衝突する実害は無い。念のため揃えているだけ）
-  4. ready.DrainReady() → process.Start()（3節。ワールドには一切触れない）
-     process.Start失敗時: state.MarkStopped()
-  5. port.ReadyWaiterからのready受信を待つ（タイムアウト付き、14節）
+  3. ready.DrainReady() → process.Start()（3節。ワールドには一切触れない。world/が無ければ
+     hardcoreプロセス自身が新規生成する）
+     process.Start失敗時: state.MarkDeactivated()（**`MarkStopped`ではない**——world/は一切
+     触れていないので、進行中だった挑戦（running）を書き換えてはならない。phaseのみstoppedへ戻す）
+  4. port.ReadyWaiterからのready受信を待つ（タイムアウト付き、14節）
      受信時 state.MarkReady(running) が呼ばれる（6節、modserverのHandleReady経由。
      runningは変更前の値がそのまま渡ってくる——プロセス起動だけでは挑戦の状態は変わらない）
      タイムアウト時: state.MarkUnknown()
-  6. port.GateNotifier経由で hardcore-ready 送信
+  5. port.GateNotifier経由で hardcore-ready 送信
 
 Deactivate(ctx, requestedBy string) error:
   1. ok, reason := state.TryMarkDeactivating()（2節。phase!=readyの場合は拒否——
@@ -278,9 +283,9 @@ Deactivate(ctx, requestedBy string) error:
   3. port.GateNotifier経由で evacuate-request(reason="deactivate") 送信
      → evacuate-complete受信までブロック（タイムアウト付き、14節）
   4. process.Stop()（3節、SIGTERM→タイムアウト後SIGKILL）
-  5. state.MarkStopped()（**`running`値は変更しない**——中断していた挑戦の状態をそのまま保持する。
-     Start/Loadの失敗パスで使うMarkStoppedと同じメソッドだが、Deactivateの成功パスでは
-     runningを書き換えない、という呼び分けはapplication層の責務）
+  5. state.MarkDeactivated()（**`running`値は変更しない**——中断していた挑戦の状態をそのまま保持する。
+     Start(clean=false)のprocess.Start失敗パスと同じ「phaseのみ戻す」メソッドを使う。Start(clean=true)/
+     Loadの失敗パスが使う`MarkStopped`〈running=falseに強制する〉とは別メソッドとして分けてある）
   6. port.GateNotifier経由で deactivate-complete 送信
 ```
 
@@ -361,7 +366,7 @@ timeouts:
 | `adapter/fsstate.Repository`の`RWMutex` | `{phase, running}` | 読み取り頻度が高い（`state-query`）ため`RWMutex`。`running`変化時のディスク書き込み（2節）はこのロックを保持したまま行う（書き込み中に別の読み取りを許すと、メモリ上の値とディスク上の値が一瞬食い違うウィンドウができるため） |
 | `application.ChallengeApplicationService.opMutex` | プロセス再起動シーケンス（`Start`〈`clean`の有無を問わず〉/`Load`/`Deactivate`）とアーカイブコピー（`HandleArchiveRequest`）の排他 | ブロッキング`sync.Mutex`（8節・8a節・4節）。レイヤー分割前は`modserver`とも共有する`*sync.Mutex`だったが、`HandleArchiveRequest`をapplication層に集約したことで完全に内部化された（1節） |
 
-`running=unknown`が「起動処理中の多重`/start`（`clean:true`）」を自然に弾く（2節）ため、`opMutex`とは別に「起動処理中フラグ」を用意する必要は無い。`clean`指定時のみ`running`チェックをスキップするが、`opMutex`自体は`clean`でも免除しない（仕様書2.1節「`force`の適用範囲」：アーカイブ実行中の排他制御は`clean`・`force`でも免除しないことと整合）。`start{clean:false}`は`running`を全く見ないため上記の「多重`/start`を弾く」仕組みの対象外だが、代わりに`TryMarkResuming`が`phase`（既に起動中か）だけで排他的に判定するため同じ効果が得られる。`TryMarkResuming`/`TryMarkDeactivating`（8a節）も同様に`phase`の排他的な検査兼コミットなので、専用のロックを別途必要としない。
+`DecideStart`自身が持つ「`phase`が`starting`/`stopping`なら`force`/`clean`の値に関わらず即座に拒否する」ガード（2節）が「遷移中の多重`/start`・`/load`・`/deactivate`」を自然に弾くため、`opMutex`とは別に「起動処理中フラグ」を用意する必要は無い。これは`running=unknown`頼みの仕組みではない点に注意——`stopping`（`/deactivate`中）では`running`は`unknown`にならず直前の値のままだが、`DecideStart`が`phase`自体を直接見るため、`clean:true`（`running`チェックを免除する指定）で来た多重呼び出しもこのガードでは免除されず正しく弾かれる。`opMutex`自体も`clean`・`force`で免除しない（仕様書2.1節「`force`の適用範囲」：アーカイブ実行中の排他制御は`clean`・`force`でも免除しないことと整合）。`start{clean:false}`・`deactivate`は`TryMarkResuming`/`TryMarkDeactivating`がそれぞれ`phase`の排他的な検査兼コミットを行うため、これも専用のロックを別途必要としない。
 
 ## 13. テスト戦略
 
@@ -372,7 +377,7 @@ hardcore MOD・Gate本体が別リポジトリのため、実MOD・実Gateを繋
 - **`adapter/osprocess`**：実際のMinecraftサーバーJarの代わりに`sh -c`の簡易スクリプトを`startCommand`に指定し、起動/`SIGTERM`停止/タイムアウト後の`SIGKILL`エスカレーションを検証する。加えて、PIDファイルによる孤児プロセス検知（3節）の回帰テストとして：①`process.Start()`後にPIDファイルが書かれ`process.Stop()`後に削除されること、②生存中のプロセスのPIDを書いたPIDファイルを用意した状態で`Runner`を新規構築すると、そのプロセスへ`SIGTERM`/`SIGKILL`が送られ終了してからPIDファイルが削除されること、③既に終了しているPID（または存在しないPID）を指すPIDファイルがあっても誤って何かを終了させようとしないこと、を検証する
 - **`adapter/fsarchive`・`adapter/fsrecords`**：一時ディレクトリ上で実際のファイルI/Oを検証する
 - **`adapter/modserver`・`adapter/gateserver`**：`net.Listen("tcp", "127.0.0.1:0")`で実TCPサーバーを起動し、テストコード側がNDJSONクライアントとして接続して往復を検証する。`Application`インターフェースはこの2パッケージそれぞれにフェイク実装を用意し、プロトコル層のテストが業務ロジック（application層）の実装に依存しないようにしている
-- **`application`**：`port.*`各インターフェースのフェイク（`fakeGate`・`fakeReady`・`fakeProcess`・`fakeWorld`・`fakeArchive`・`fakeRecords`・`fakeClock`）＋実物の`adapter/fsstate.Repository`を組み合わせ、`Start`（`clean`両パターン）/`Load`/`Deactivate`の一連シーケンス（8節・8a節）・各失敗パスでのstate復旧・`opMutex`によるアーカイブとの排他を検証する。`Start(clean=false)`が`fakeWorld.Exists()==false`で拒否されること、既に起動中の状態で`Start(clean=false)`を呼ぶと拒否されること、`Start(clean=false)`は`fakeWorld`のワイプ/復元メソッドを一切呼ばないこと、`Deactivate`成功後も`running`値が変化しないことも検証する
+- **`application`**：`port.*`各インターフェースのフェイク（`fakeGate`・`fakeReady`・`fakeProcess`・`fakeWorld`・`fakeArchive`・`fakeRecords`・`fakeClock`）＋実物の`adapter/fsstate.Repository`を組み合わせ、`Start`（`clean`両パターン）/`Load`/`Deactivate`の一連シーケンス（8節・8a節）・各失敗パスでのstate復旧・`opMutex`によるアーカイブとの排他を検証する。既に起動中の状態で`Start(clean=false)`を呼ぶと拒否されること、遷移中（`starting`/`stopping`）は`clean`の値に関わらず「処理中です」で拒否されること、`Start(clean=false)`は`fakeWorld`のワイプ/復元メソッドを一切呼ばないこと（`world/`の有無も判定に使わない）、`Deactivate`成功後も`running`値が変化しないことも検証する
 - **`internal/e2e`（真のE2E、`cmd/manager`のブラックボックステスト）**：上記までは全て「1層をfakeで固めて検証する」統合テストだが、`internal/e2e/e2e_test.go`だけは唯一、`cmd/manager`を`go build`で実際にビルドし、サブプロセスとして起動し、実TCP接続でGate役として接続して検証する。hardcore役も`cmd/fakehardcore`という専用の小さなヘルパーバイナリ（同じくこのリポジトリの`cmd/`配下、製品には含めない）を実際にサブプロセスとして起動し、MOD⇔Manager間のNDJSONプロトコルを実際にしゃべらせる。検証内容：
   - `state-query`→`start`（force無し、拒否）→`start`（force有り）→`evacuate-request`/`evacuate-complete`→`hardcore-ready`→`state-query`（ready/true確認）
   - `server.properties`の`hardcore=true`強制が実際に反映されていること
@@ -428,3 +433,4 @@ hardcore MOD・Gate本体が別リポジトリのため、実MOD・実Gateを繋
 - **【レビュー指摘への対応】孤児プロセス対策としてPIDファイルによる生存確認を追加**：上記デッドロック修正のレビュー中、「`phase`は常に`stopped`で再初期化する」（14節旧項目6）という前提は、Manager自体が`SIGTERM`で正常終了する場合にしか成立しないという指摘があった。Manager自体が`panic`・OOM Kill・`SIGKILL`で即死した場合はグレースフルシャットダウンが走らず、hardcore子プロセスが孤児として生き残ったまま、新しいManagerが「止まっている」と誤認して`phase=stopped`で起動しうる。この状態で`start{clean:false}`が受理されると、生きている旧プロセスと同じ`world/`・同じポートへ向けて新しいプロセスを二重起動してしまう危険があった。
   - 対応：`process.Start()`成功時に子プロセスのPIDを`config.hardcore.pidFile`（例：`./hardcore.pid`）へ書き込み、`process.Stop()`の正常完了時に削除する。Manager起動時（Gate⇔Manager用TCPサーバーがリッスンを始める前）に、このPIDファイルが指すプロセスが実際に生きているかを確認し、生きていれば`SIGTERM`→`SIGKILL`で強制終了させてからPIDファイルを削除し、通常の`phase=stopped`起動を続行するようにした（3節）。これにより「Manager単体クラッシュ後の二重起動」というリスクは、Manager起動シーケンスの最初期に確実に解消されるようになった
   - PID再利用（OS再起動等で無関係な別プロセスに同じPIDが割り当てられているケース）による誤検知の可能性は残っており、コマンドライン照合をどこまで厳密に行うかは14節の未確定事項として追加した
+- **【バグ修正】`/start`（`clean`無し）の誤ったワールド存在チェックを削除**：上記デッドロック修正の実装（`port.WorldPreparer.Exists()`・8a節の`start{clean:false}`手順1）はdocker compose環境での手動確認で「`world/`が存在しない状態（真新しいデプロイ）で`/start`を送ると`start-rejected`『ワールドが存在しません』になり、`/start clean`か`/load`を使わないと一度も起動できない」という不具合として発覚した。原因は設計段階のドキュメント間の食い違い：`specification.md` 2.1節のコマンド表・状態別挙動表（状態①）は一貫して「`/start`（`clean`無し）は`world/`が無ければ拒否ではなく新規作成して起動する」と明記していたにもかかわらず、本ドキュメント（`architecture-manager.md`）8a節の疑似コードと`docs/protocol-gate-manager.md`のプロトコル定義には、これと矛盾する「`world/`が無ければ`start-rejected`『ワールドが存在しません』」という誤った拒否分岐が書かれており、実装はこの誤った記述の方に従っていた。一次仕様（`specification.md`）を正として、`application.ChallengeApplicationService`から`World.Exists()`の呼び出し（および対応する拒否分岐）を削除し、`start{clean:false}`は`world/`の有無を一切見ずにプロセスを起動するだけにした（`world/`が無ければhardcoreプロセス自身が新規生成する、3節）。`port.WorldPreparer.Exists()`・`adapter/osprocess.Runner.Exists()`自体は今回のバグ修正では削除せず、未使用のまま残っている。あわせて、`Deactivate`の成功パス・`Start(clean=false)`のプロセス起動失敗パスが使う状態遷移メソッドを、`MarkStopped`の呼び分けではなく独立した`MarkDeactivated`（`running`を変更せず`phase`のみ`stopped`に戻す）として実装し直し、本ドキュメント（2節・8a節）もそれに合わせて更新した。本ドキュメント・`docs/protocol-gate-manager.md`・`specification.md`自体に残っていた関連する不整合（`/start clean`・`/deactivate`が遷移中でも拒否されうる点の記述漏れ等）もあわせて修正した

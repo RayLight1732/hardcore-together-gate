@@ -109,6 +109,8 @@ TCP接続が切れた場合、Managerは自身の`os/exec`ハンドルでhardcor
 
 旧設計では両者を区別せず一律「不明→`true`」としていたため、**一度もhardcoreを起動したことが無い状態（永続化された値が存在しない）でも`true`扱いになり、`/start`が永遠に拒否され続けるデッドロックがあった**。`running`値の永続化と、この区別により解消した（`specification.md` 2.1節「プロセス状態と`running`の永続化」・3.1節）。
 
+**`/deactivate`・`/start clean`・`/load`によるプロセス停止中は、上記の区別すら行わない**：MODのTCP接続が閉じるタイミング（MOD自身がプロセス終了直前にソケットを閉じる）と、Managerの`os/exec`が実際に子プロセスの終了を検知するタイミング（`cmd.Wait()`の完了）は別々のOS通知であり、どちらが先に届くかの保証が無い。Managerが自ら`process.Stop()`を呼んでいる最中（`phase`が`starting`〈`/start clean`・`/load`の停止フェーズ〉または`stopping`〈`/deactivate`〉）に切断を検知した場合、その切断は予期されたものであり何のシグナルでもない——その操作自身が完了時に`MarkStopped`/`MarkDeactivated`で正確な状態を記録するため、切断ハンドラが`running`を書き換えると、その操作の結果と競合し`running`を誤って`unknown`にしてしまう（`phase==ready`のとき、つまりManager自身が停止を指示していない場合に限り、上記の生死確認に基づく判定を行う）。
+
 ## 6. シーケンス例
 
 ```mermaid

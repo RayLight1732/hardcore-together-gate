@@ -190,16 +190,18 @@ Managerが内部で持つ状態は2つで、常にペアで扱う（仕様書3.1
 
 `docs/protocol-gate-manager.md`のサーバー側実装。設定可能なアドレス（Docker network内限定、ホストへは公開しない）でリッスンする。6節同様、業務判断を持たない薄いアダプタで、`Application`インターフェース（`gateserver`パッケージ内で定義）へ委譲する。
 
+**`requestId`**（`docs/protocol-gate-manager.md` 1節）：Gate側が要求ごとに発行するUUID文字列。全ての受信メッセージが持ち、対応する送信（応答）は同じ値をそのままエコーする。区別を設けず、この節で扱う受信・送信の全メッセージが対象。`Application`の各メソッド・`port.GateNotifier`の各メソッドは、いずれも`requestID string`を1引数として受け取り（または返す応答へ含め）、値の中身は一切解釈せずそのまま運ぶだけ。
+
 | 受信 | 処理 |
 |---|---|
-| `state-query` | `Application.Snapshot()`をそのまま`state-response`として返す（同期応答） |
-| `start` | `Application.Start(ctx, clean, requestedBy)`を呼ぶ（8節・8a節。`clean`の値で内部分岐する） |
-| `load` | `Application.Load(ctx, name, force, requestedBy)`を呼ぶ（8節） |
-| `deactivate` | `Application.Deactivate(ctx, requestedBy)`を呼ぶ（8a節） |
-| `savedata-query` | `Application.SaveData()`の結果を`savedata-response`で返す |
-| `senpan-query` | `Application.Senpan()`の結果を`senpan-response`で返す |
+| `state-query` | `Application.Snapshot(requestID)`をそのまま`state-response`として返す（同期応答） |
+| `start` | `Application.Start(ctx, requestID, clean, requestedBy)`を呼ぶ（8節・8a節。`clean`の値で内部分岐する） |
+| `load` | `Application.Load(ctx, requestID, name, force, requestedBy)`を呼ぶ（8節） |
+| `deactivate` | `Application.Deactivate(ctx, requestID, requestedBy)`を呼ぶ（8a節） |
+| `savedata-query` | `Application.SaveData(requestID)`の結果を`savedata-response`で返す |
+| `senpan-query` | `Application.Senpan(requestID)`の結果を`senpan-response`で返す |
 
-送信（`application.ChallengeApplicationService`からのコールバック経由、`port.GateNotifier`実装として）：`start-rejected`/`load-rejected`/`deactivate-rejected`（拒否理由付き）、`evacuate-request`→`evacuate-complete`待ち、`hardcore-ready`、`deactivate-complete`。
+送信（`application.ChallengeApplicationService`からのコールバック経由、`port.GateNotifier`実装として）：`start-rejected`/`load-rejected`/`deactivate-rejected`（拒否理由付き）、`evacuate-request`→`evacuate-complete`待ち、`hardcore-ready`、`deactivate-complete`、`start-failed`/`load-failed`/`deactivate-failed`（`reason`・`recovered`付き。受理後の失敗を伝える。`docs/protocol-gate-manager.md` 3.5b節、8節・8a節参照）。いずれも`requestID`を伴う。`Start`/`Load`/`Deactivate`は受信からコールバックまでの間に非同期のシーケンス（8節・8a節）を挟むため、`requestID`はその間`ChallengeApplicationService`内部の呼び出し連鎖全体（`runSequence`・`launchAndAwaitReady`等）を通じて引き回される。
 
 Gate側は起動時に接続しにくるクライアントであり、Managerは常時リッスンする。Gate接続が切れている間に`start`/`load`は届かないため、application層で「Gate接続の有無」を気にする必要は無い（Gateが状態不明として振る舞うだけ、仕様書2.1節）。
 
@@ -221,6 +223,7 @@ Start(ctx, clean bool, requestedBy string) error:
      実質「force固定」と同じ意味になる。ただしphaseが遷移中〈starting/stopping〉なら
      forceでも拒否される〈domain/challenge.DecideStartの遷移中ガード、2節〉。
      ここはopMutex不要）
+     ok==false なら start-rejected(reason) を送って終了
   3. opMutex.Lock() → defer Unlock()
   4. reason := "force-reset"（`docs/protocol-gate-manager.md` 3.5節：`start`のclean:trueは
      常にforce-reset固定。`prior.Running`の値では分岐しない——`load`のforce:trueとはここが異なる）
@@ -228,26 +231,44 @@ Start(ctx, clean bool, requestedBy string) error:
      stoppedなら手順4〜5は省略し手順5aへ）
      → evacuate-complete受信までブロック（タイムアウト付き、14節）
      失敗時: state.Restore(prior)（何も壊していないので手順1の状態へ戻す）
+     → start-failed(reason, recovered=true) 送信（何も変えていないので常に安全に復帰できる）
   5. process.Stop()（3節、port.ProcessRunner。手順4を経由した場合のみ）
-     失敗時: state.MarkUnknown()（停止できたか不明。phaseはstartingのまま＝forceでしか抜けられない安全側）
+     失敗時: process.IsRunning()（3節）で生死を再確認する
+       生きていない場合: state.MarkDeactivated()＋state.MarkUnknown()（phaseをstoppedへ戻す。
+         runningはこの時点では判定できないのでunknownのまま——running自体の正確性は
+         次回のready/running-changedで回復する） → start-failed(reason, recovered=true) 送信
+       まだ生きている場合: state.MarkUnknown()（phaseはstartingのまま——running=trueかもしれない
+         プロセスと世界を共有した状態で先へ進むのは危険なため、安全側に倒して停止させる）
+         → start-failed(reason, recovered=false) 送信
   5a. world.WipeWorld()＋world.EnsureHardcoreMode()（3節、port.WorldPreparer。Loadの場合は
      archives.Restore、後述）
      失敗時: state.MarkStopped()（旧プロセスの停止は確認済み、新プロセスも無い＝running=false は正確）
+     → start-failed(reason, recovered=true) 送信
   6. ready.DrainReady() → process.Start()（3節）
-     process.Start失敗時: state.MarkStopped()
+     process.Start失敗時: state.MarkStopped()（旧プロセスの停止・ワールド準備は確認済みで
+       新プロセスも一度も起動していない＝生死確認不要、常にrecovered=true）
+       → start-failed(reason, recovered=true) 送信
   7. port.ReadyWaiter からの ready 受信を待つ（タイムアウト付き）
      受信時 state.MarkReady(running) が呼ばれる（6節、modserverのHandleReady経由。ここでは何もしない）
-     タイムアウト時: state.MarkUnknown()（起動できたか不明。遅れてreadyが届けばmodserver側が
-     独立に補正するので、ここでは安全側に倒すだけでよい）
+     タイムアウト時: process.IsRunning()で生死を再確認する（手順5と同じ考え方）
+       生きていない場合（プロセスがready送信前にクラッシュした等）: state.MarkDeactivated()＋
+         state.MarkUnknown() → start-failed(reason, recovered=true) 送信
+       まだ生きている場合（起動が遅いだけの可能性が残る）: state.MarkUnknown()（phaseはstartingの
+         まま。遅れてreadyが届けばmodserver側のHandleReadyが独立に補正するので、起動そのものが
+         無駄になるわけではない） → start-failed(reason, recovered=false) 送信
   8. port.GateNotifier経由で hardcore-ready 送信
+     送信自体が失敗した場合はログのみ（14節未確定事項：処理自体は既に成功しているため
+     start-failedを送るのは不適切だが、Gate側に伝える代替手段が無い）
 ```
 
 `Load(ctx, name, force, requestedBy)`もほぼ同じ流れだが：
 - 手順2の直後（opMutex獲得**前**）に追加のアーカイブ存在チェックを行う：`archive/<name>/`の有無、`name=="latest"`の場合は全`meta.json`の`createdAt`を比較して最新を選ぶ。存在しなければ`state.Restore(prior)`で手順2の状態へ戻し、`load-rejected`を送る。**このチェックの前にrunningチェック（手順2）を済ませておくことで、「runningがtrueかつ指定アーカイブも存在しない」場合に仕様書2.1節の想定通り「挑戦が進行中です」が優先される**（アーカイブ不在エラーではなく）
 - 手順5aが「テンプレートコピー」の代わりに「`world.WipeWorld()` → `archives.Restore(name)`（4節）→ `world.EnsureHardcoreMode()`」になる。`archives.Restore`自体はコピーのみでworld/の削除は行わないため、`Start`と同じく明示的な`WipeWorld`呼び出しが必要（4節参照。ここを配線し忘れた実装バグが一度発生し、修正済み）。`EnsureHardcoreMode`はStartと同じ理由（`server.properties`はworld/の外にあり、アーカイブの復元対象に含まれないため）でLoadでも呼ぶ
+- 各失敗時の通知は`start-failed`ではなく`load-failed`を送る（それ以外の`reason`・`recovered`の判断基準は共通）
 
 - **タイムアウト**：手順4（`evacuate-complete`待ち）・手順7（`ready`待ち）はいずれも無期限ブロックしない。具体的な秒数は14節の未確定事項（Gate側の`architecture-gate.md`にも同種の未確定事項があり、双方で値を揃える必要がある）
 - **`opMutex`は`Start`/`Load`/`Deactivate`/`HandleArchiveRequest`（8a節・6節・4節）で共有する**唯一のロックであり、「進行中は片方をブロックする」という仕様書3.2節の要求をこれ1本で満たす
+- **`recovered`の判断基準（`port.ProcessRunner.IsRunning()`が使えない手順4・5a・6は決定的、手順5・7のみ実行時に確認）**：手順4（evacuate失敗）は何も壊していないので常に`true`。手順5a・6（ワールド準備・プロセス起動失敗）は直前の手順5で旧プロセスの停止を確認済みなので常に`true`。手順5（停止失敗）・7（readyタイムアウト）は`process.IsRunning()`で生死を確認できた場合のみ`true`——生きている可能性が残る間は、`world/`やポートを共有する新しい操作を受け付けてしまうと二重起動の危険があるため、`recovered=false`のまま`phase`を`starting`に留め置き、遷移中ガード（2節）でブロックし続ける。この状態から抜ける手段は現状Manager自体の再起動のみ（`specification.md` 10節の未決事項）
 - **失敗時のstate復旧はいずれも仕様書に明記が無く、実装時に補った**：どこまで進んだ時点で失敗したかによって「安全に主張できる内容」が異なる（手順4失敗＝何も壊していないので直前の状態に戻せる、手順5失敗＝停止できたか不明なので`unknown`、手順5a・6失敗＝旧プロセスの停止は確認済みなので`running=false`は正確、手順7失敗＝新プロセスが実際には生きているかもしれないので`unknown`）という考え方で使い分けている
 
 ## 8a. `Start`（`clean:false`）・`Deactivate`の実装（`application.ChallengeApplicationService`）
@@ -268,11 +289,17 @@ Start(ctx, clean=false, requestedBy string) error:
   3. ready.DrainReady() → process.Start()（3節。ワールドには一切触れない。world/が無ければ
      hardcoreプロセス自身が新規生成する）
      process.Start失敗時: state.MarkDeactivated()（**`MarkStopped`ではない**——world/は一切
-     触れていないので、進行中だった挑戦（running）を書き換えてはならない。phaseのみstoppedへ戻す）
+     触れていないので、進行中だった挑戦（running）を書き換えてはならない。phaseのみstoppedへ戻す。
+     プロセスは一度も起動していないので生死確認は不要、常にrecovered=true）
+     → start-failed(reason, recovered=true) 送信
   4. port.ReadyWaiterからのready受信を待つ（タイムアウト付き、14節）
      受信時 state.MarkReady(running) が呼ばれる（6節、modserverのHandleReady経由。
      runningは変更前の値がそのまま渡ってくる——プロセス起動だけでは挑戦の状態は変わらない）
-     タイムアウト時: state.MarkUnknown()
+     タイムアウト時: process.IsRunning()で生死を確認する（8節手順7と同じ考え方）
+       生きていない場合: state.MarkDeactivated()＋state.MarkUnknown() → start-failed(reason,
+         recovered=true) 送信
+       まだ生きている場合: state.MarkUnknown()（phaseはstartingのまま） → start-failed(reason,
+         recovered=false) 送信
   5. port.GateNotifier経由で hardcore-ready 送信
 
 Deactivate(ctx, requestedBy string) error:
@@ -282,14 +309,21 @@ Deactivate(ctx, requestedBy string) error:
   2. opMutex.Lock() → defer Unlock()
   3. port.GateNotifier経由で evacuate-request(reason="deactivate") 送信
      → evacuate-complete受信までブロック（タイムアウト付き、14節）
+     失敗時: state.Restore(prior)（何も壊していないので手順1の状態〈phase==ready〉へ戻す）
+     → deactivate-failed(reason, recovered=true) 送信
   4. process.Stop()（3節、SIGTERM→タイムアウト後SIGKILL）
+     失敗時: process.IsRunning()で生死を確認する（8節手順5と同じ考え方）
+       生きていない場合: state.MarkDeactivated()＋state.MarkUnknown() → deactivate-failed(reason,
+         recovered=true) 送信
+       まだ生きている場合: state.MarkUnknown()（phaseはstoppingのまま） → deactivate-failed(reason,
+         recovered=false) 送信
   5. state.MarkDeactivated()（**`running`値は変更しない**——中断していた挑戦の状態をそのまま保持する。
      Start(clean=false)のprocess.Start失敗パスと同じ「phaseのみ戻す」メソッドを使う。Start(clean=true)/
      Loadの失敗パスが使う`MarkStopped`〈running=falseに強制する〉とは別メソッドとして分けてある）
   6. port.GateNotifier経由で deactivate-complete 送信
 ```
 
-`Start(clean=false)`は`world.WipeWorld()`・`archives.Restore()`のいずれも呼ばない点が`Start(clean=true)`/`Load`との唯一の違いであり、それ以外（`opMutex`獲得〜`process.Start()`〜`ready`待ち〜`hardcore-ready`送信）は8節の手順6〜8と完全に共通のロジックである。実装時は、この共通する後半部分を1つの非公開ヘルパー関数に切り出し、`Start(clean=true)`/`Load`/`Start(clean=false)`の3箇所から呼ぶ形にするとよい（重複を避けるため。仕様書側は`/start`（`clean`無し）を「ワールド操作を伴わない`/start clean`・`/load`の共通部分」と位置付けている、`specification.md` 2.1節）。
+`Start(clean=false)`は`world.WipeWorld()`・`archives.Restore()`のいずれも呼ばない点が`Start(clean=true)`/`Load`との唯一の違いであり、それ以外（`opMutex`獲得〜`process.Start()`〜`ready`待ち〜`hardcore-ready`送信）は8節の手順6〜8と完全に共通のロジックである。実装時は、この共通する後半部分を1つの非公開ヘルパー関数に切り出し、`Start(clean=true)`/`Load`/`Start(clean=false)`の3箇所から呼ぶ形にするとよい（重複を避けるため。仕様書側は`/start`（`clean`無し）を「ワールド操作を伴わない`/start clean`・`/load`の共通部分」と位置付けている、`specification.md` 2.1節）。`start-failed`/`deactivate-failed`の送信もこの共有ヘルパーに含められる（`recovered`の判定ロジック自体が8節と共通のため）。
 
 `Deactivate`は`evacuate-request`を伴う点が`Start(clean=true)`/`Load`と共通しており、こちらも同様の共通化が可能（`evacuate-request`送信〜`evacuate-complete`待ち〜`process.Stop()`の部分）。
 
@@ -401,6 +435,7 @@ hardcore MOD・Gate本体が別リポジトリのため、実MOD・実Gateを繋
 7. **`docs/protocol-gate-manager.md`・`docs/protocol-mod-manager.md`の変更フロー**：3リポジトリ（Gate・Manager・hardcore MOD）間でプロトコル定義をどう同期するか
 8. **`state.json`の書き込み失敗時の扱い**（2節）：ディスクフル・権限エラー等で永続化書き込みが失敗した場合、`SetRunning`/`MarkReady`自体を失敗させてオンメモリの状態もロールバックするか、オンメモリだけは更新してログ警告に留めるか未確定
 9. **PIDファイルの生存確認の具体的な実装**（3節）：PID再利用による誤検知対策として`/proc/<pid>/cmdline`等でのコマンド照合まで行うか、単純なシグナル送信によるプロセス存在確認だけに留めるかは未確定。いずれもLinux（Docker運用、1節）を前提とした実装になる
+10. **`start-failed`/`load-failed`/`deactivate-failed`が`recovered:false`を返した場合の手動復旧手段**（8節・8a節、`specification.md` 10節・`docs/protocol-gate-manager.md` 5節と共通）：現状はManager自体の再起動以外に復旧手段が無い。専用の強制復旧コマンド（例：`phase`を手動で`stopped`へ戻す）を追加するかは未確定
 
 （`Deactivate`のプロセス停止は3節の`process.Stop()`をそのまま再利用するため、`processStopSeconds`〈9節〉のタイムアウト設定も共用でき、新規の未確定事項にはならない）
 
@@ -434,3 +469,8 @@ hardcore MOD・Gate本体が別リポジトリのため、実MOD・実Gateを繋
   - 対応：`process.Start()`成功時に子プロセスのPIDを`config.hardcore.pidFile`（例：`./hardcore.pid`）へ書き込み、`process.Stop()`の正常完了時に削除する。Manager起動時（Gate⇔Manager用TCPサーバーがリッスンを始める前）に、このPIDファイルが指すプロセスが実際に生きているかを確認し、生きていれば`SIGTERM`→`SIGKILL`で強制終了させてからPIDファイルを削除し、通常の`phase=stopped`起動を続行するようにした（3節）。これにより「Manager単体クラッシュ後の二重起動」というリスクは、Manager起動シーケンスの最初期に確実に解消されるようになった
   - PID再利用（OS再起動等で無関係な別プロセスに同じPIDが割り当てられているケース）による誤検知の可能性は残っており、コマンドライン照合をどこまで厳密に行うかは14節の未確定事項として追加した
 - **【バグ修正】`/start`（`clean`無し）の誤ったワールド存在チェックを削除**：上記デッドロック修正の実装（`port.WorldPreparer.Exists()`・8a節の`start{clean:false}`手順1）はdocker compose環境での手動確認で「`world/`が存在しない状態（真新しいデプロイ）で`/start`を送ると`start-rejected`『ワールドが存在しません』になり、`/start clean`か`/load`を使わないと一度も起動できない」という不具合として発覚した。原因は設計段階のドキュメント間の食い違い：`specification.md` 2.1節のコマンド表・状態別挙動表（状態①）は一貫して「`/start`（`clean`無し）は`world/`が無ければ拒否ではなく新規作成して起動する」と明記していたにもかかわらず、本ドキュメント（`architecture-manager.md`）8a節の疑似コードと`docs/protocol-gate-manager.md`のプロトコル定義には、これと矛盾する「`world/`が無ければ`start-rejected`『ワールドが存在しません』」という誤った拒否分岐が書かれており、実装はこの誤った記述の方に従っていた。一次仕様（`specification.md`）を正として、`application.ChallengeApplicationService`から`World.Exists()`の呼び出し（および対応する拒否分岐）を削除し、`start{clean:false}`は`world/`の有無を一切見ずにプロセスを起動するだけにした（`world/`が無ければhardcoreプロセス自身が新規生成する、3節）。`port.WorldPreparer.Exists()`・`adapter/osprocess.Runner.Exists()`自体は今回のバグ修正では削除せず、未使用のまま残っている。あわせて、`Deactivate`の成功パス・`Start(clean=false)`のプロセス起動失敗パスが使う状態遷移メソッドを、`MarkStopped`の呼び分けではなく独立した`MarkDeactivated`（`running`を変更せず`phase`のみ`stopped`に戻す）として実装し直し、本ドキュメント（2節・8a節）もそれに合わせて更新した。本ドキュメント・`docs/protocol-gate-manager.md`・`specification.md`自体に残っていた関連する不整合（`/start clean`・`/deactivate`が遷移中でも拒否されうる点の記述漏れ等）もあわせて修正した
+- **【設計変更】`start`・`load`・`deactivate`が受理後に失敗した場合の通知が存在しなかった問題を修正**：受理判定（`*-rejected`）は「受理する前」のチェック専用であり、受理した後（退避・プロセス停止・ワールド準備・プロセス起動・`ready`待ちのいずれか）で失敗した場合に結果を伝える手段が無かった。docker compose環境での実機確認で、hardcoreプロセスがファイル権限エラーで起動直後にクラッシュした際、Gate側は`evacuate-complete`送信後`hardcore-ready`が届かないまま無期限に待ち続ける（プレイヤーからは操作がハングしたように見える）という不具合として発覚した。
+  - さらに悪いことに、この種の失敗（`process.Stop()`失敗・`ready`タイムアウト）は`state.MarkUnknown()`のみを呼び`phase`を`starting`/`stopping`のまま放置していたため、**`domain/challenge`の遷移中ガード**（2節。`/start`初回デッドロック修正時の別の不具合対応で追加した、`phase`が遷移中なら`force`/`clean`でも問答無用で拒否するガード）と組み合わさり、**一度この失敗を踏むと、Manager自体を再起動する以外にどのコマンドも受け付けなくなる**という、旧デッドロックとは別種の恒久ロックが生じることも判明した
+  - 対応1：`start-failed`/`load-failed`/`deactivate-failed`（`reason`・`recovered`付き、`docs/protocol-gate-manager.md` 3.5b節）を新設し、受理後の失敗を必ずGateへ通知するようにした（8節・8a節）
+  - 対応2：`process.Stop()`失敗・`ready`タイムアウトの2箇所（いずれも「停止・起動できたか不明」で`phase`を動かせずにいた箇所）で、`port.ProcessRunner.IsRunning()`によりプロセスの生死を再確認するようにした。生きていないと確認できた場合は`phase`を`stopped`へ戻し（`recovered=true`、以降のコマンドは即座に再試行可能）、確認できない場合のみ`recovered=false`のまま`phase`を維持する（生きているプロセスと`world/`・ポートを共有する新しいプロセスを二重起動する危険を避けるため、ここは安全側に倒したまま）
+  - `recovered=false`のまま抜け出す手段は依然として無く（14節未確定事項に追加）、Manager自体の再起動が唯一の復旧手段のまま残っている

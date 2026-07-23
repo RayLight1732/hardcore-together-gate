@@ -87,7 +87,7 @@ plugins/hardcoretogether/       Gate側プラグイン（proxy.Plugin実装）
 | `/rta` | cmd_rta.go | なし | `managerclient.QueryState`で現在状態を取得し、`Ready`のときのみhardcoreへ接続。それ以外は状態に応じたメッセージ |
 | `/lobby` | cmd_rta.go | なし | 常にlobbyへ接続 |
 | `/start` | cmd_start.go | `hardcoretogether.admin` | `managerclient`へ`start{clean:false}`送信 → `start-rejected`または`hardcore-ready`のいずれかで結果を受ける（退避は発生しない、`specification.md` 2.1節） |
-| `/start clean` | cmd_start.go | `hardcoretogether.admin` | `managerclient`へ`start{clean:true}`送信 → 常に受理され、`evacuate-request`（→退避後は`hardcore-ready`）で結果を受ける |
+| `/start clean` | cmd_start.go | `hardcoretogether.admin` | `managerclient`へ`start{clean:true}`送信 → `running`による拒否は無いが遷移中なら`start-rejected`（「処理中です」）もありうる、それ以外は`evacuate-request`（→退避後は`hardcore-ready`）で結果を受ける |
 | `/load <name\|latest> [force]` | cmd_load.go | `hardcoretogether.admin` | `managerclient`へ`load`送信 → `load-rejected`または`evacuate-request`（→退避後は`hardcore-ready`）のいずれかで結果を受ける |
 | `/deactivate` | cmd_deactivate.go | `hardcoretogether.admin` | `managerclient`へ`deactivate`送信 → `deactivate-rejected`または`evacuate-request`（→退避後は`deactivate-complete`）のいずれかで結果を受ける |
 | `/savedata` | cmd_records.go | なし | `managerclient`へ`savedata-query`送信、`savedata-response`を整形表示 |

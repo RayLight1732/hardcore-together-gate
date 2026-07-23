@@ -1,0 +1,29 @@
+name: Apply docs update
+on:
+  workflow_dispatch:
+
+jobs:
+  apply-docs:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v5
+
+      - name: Refresh docs from hardcore-together-docs
+        run: make docs
+
+      - name: Open a PR with the refreshed docs (no-op if nothing changed)
+        uses: peter-evans/create-pull-request@v7
+        with:
+          # デフォルトのGITHUB_TOKENはこのPRからlint/testワークフローを起動できない
+          # （required status checksがそろわずマージ不可になる）ため、fine-grained PAT
+          # を使う。
+          token: ${{ secrets.DOCS_SYNC_PAT }}
+          commit-message: "docs: hardcore-together-docsから同期"
+          branch: docs-sync
+          delete-branch: true
+          title: "docs: hardcore-together-docsから同期"
+          body: |
+            `workflow_dispatch`による手動実行で`make docs`を実行し、`hardcore-together-docs`リポジトリの最新内容を`docs/`へ反映したPRです。
+
+            差分が無い場合、このPRは作成されません。

@@ -51,6 +51,24 @@ func (s *adminState) take(requestID string) (command.Source, string, bool) {
 	return entry.source, entry.doneText, true
 }
 
+// takeAll empties the map and returns every entry that was pending, for use
+// when the connection to Manager drops: none of them can be corresponded to
+// a response anymore (docs/architecture-gate.md 2.5節), so whoever issued
+// them needs telling rather than being left to wait forever.
+func (s *adminState) takeAll() []adminEntry {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if len(s.pending) == 0 {
+		return nil
+	}
+	entries := make([]adminEntry, 0, len(s.pending))
+	for _, entry := range s.pending {
+		entries = append(entries, entry)
+	}
+	s.pending = nil
+	return entries
+}
+
 // onAdminRejected handles Manager's start-rejected/load-rejected/
 // deactivate-rejected (docs/protocol-gate-manager.md 3.4節): show the
 // rejection reason to whoever issued the matching request.
@@ -59,7 +77,7 @@ func (d *deps) onAdminRejected(_ context.Context, requestID, reason string) {
 	if !ok {
 		return
 	}
-	_ = src.SendMessage(errorText(reason))
+	d.notify(src, errorText(reason))
 }
 
 // onAdminCompleted handles Manager's hardcore-ready (docs/protocol-gate-manager.md
@@ -70,7 +88,7 @@ func (d *deps) onAdminCompleted(_ context.Context, requestID string) {
 	if !ok {
 		return
 	}
-	_ = src.SendMessage(infoText(text))
+	d.notify(src, infoText(text))
 }
 
 // onAdminFailed handles Manager's start-failed/load-failed/
@@ -90,5 +108,18 @@ func (d *deps) onAdminFailed(_ context.Context, requestID, reason string, recove
 	if !recovered {
 		text += "（手動での確認が必要です）"
 	}
-	_ = src.SendMessage(errorText(text))
+	d.notify(src, errorText(text))
+}
+
+// onDisconnected handles the Gate<->Manager connection dropping
+// (managerclient.Client's OnDisconnected): every /start, /load or
+// /deactivate still pending at this point can never resolve normally — a
+// reconnect starts a fresh TCP stream that carries no memory of what was
+// in flight on the old one — so tell each waiting player their request's
+// outcome is now unknown instead of leaving them hanging indefinitely, and
+// drop the entries so they don't leak.
+func (d *deps) onDisconnected(_ context.Context) {
+	for _, entry := range d.admin.takeAll() {
+		d.notify(entry.source, errorText("Managerとの接続が切れたため、操作結果が確認できません。/rtaで状態を確認してください"))
+	}
 }

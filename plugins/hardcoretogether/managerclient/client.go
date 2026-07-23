@@ -124,8 +124,13 @@ type message struct {
 	Entries []SenpanEntry `json:"entries,omitempty"`
 }
 
-// Client is a persistent connection to Manager. Create with New, then run
-// Client.Run in a goroutine for the lifetime of the plugin.
+// Client is a persistent connection to Manager. Create with New, set any of
+// the On* callback fields below, then run Client.Run in a goroutine for the
+// lifetime of the plugin — in that order. The On* fields are plain struct
+// fields with no internal synchronization, so they must all be assigned
+// before the first call to Run and never reassigned afterward; Run's
+// internal goroutine reads them concurrently once started, and a later
+// write from another goroutine would be a data race.
 type Client struct {
 	addr string
 	log  logr.Logger
@@ -159,6 +164,15 @@ type Client struct {
 	// and every admin command keeps getting rejected with "処理中です" until
 	// Manager itself is restarted (docs/specification.md 2.1節).
 	OnAdminFailed func(ctx context.Context, requestID, reason string, recovered bool)
+	// OnDisconnected is called once whenever the TCP connection to Manager
+	// drops (after having been up), before Run starts retrying. Any
+	// request accepted before the drop can no longer be corresponded to a
+	// response — reconnecting opens a fresh TCP stream that Manager may
+	// reply on with no memory of what was in flight on the old one — so
+	// callers should treat every request still pending at this point as
+	// permanently unresolved and notify accordingly, rather than leaving
+	// it to hang forever.
+	OnDisconnected func(ctx context.Context)
 
 	connMu sync.Mutex
 	conn   net.Conn
@@ -220,6 +234,9 @@ func (c *Client) Run(ctx context.Context) {
 		c.setConn(nil)
 		_ = conn.Close()
 		c.log.Info("disconnected from manager, will reconnect")
+		if c.OnDisconnected != nil {
+			go c.OnDisconnected(context.Background())
+		}
 	}
 }
 

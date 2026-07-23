@@ -97,12 +97,13 @@ func newTestDeps(t *testing.T, srv *mockmanager.Server) *deps {
 	t.Helper()
 	client := managerclient.New(srv.Addr, logr.Discard())
 	d := &deps{client: client, log: logr.Discard()}
-	// onAdminRejected/onAdminCompleted/onAdminFailed never touch d.proxy
-	// (unlike OnEvacuateRequest/OnHardcoreReady), so it's safe to wire them
-	// up at this test tier.
+	// onAdminRejected/onAdminCompleted/onAdminFailed/onDisconnected never
+	// touch d.proxy (unlike OnEvacuateRequest/OnHardcoreReady), so it's
+	// safe to wire them up at this test tier.
 	client.OnAdminRejected = d.onAdminRejected
 	client.OnAdminCompleted = d.onAdminCompleted
 	client.OnAdminFailed = d.onAdminFailed
+	client.OnDisconnected = d.onDisconnected
 
 	ctx, cancel := context.WithCancel(context.Background())
 	t.Cleanup(cancel)
@@ -237,6 +238,35 @@ func TestStartCommand_Failed(t *testing.T) {
 	if !strings.Contains(src.last(), "手動") {
 		t.Fatalf("last message = %q, want it to mention manual confirmation since recovered=false", src.last())
 	}
+}
+
+// TestStartCommand_NotifiedOnDisconnect guards against a pending admin
+// request hanging forever: if Manager accepts a /start and then the
+// connection drops before any rejection/failure/completion arrives, the
+// player must be told the outcome is unknown rather than being left with
+// only their original "起動しています" notice and no further word, ever.
+func TestStartCommand_NotifiedOnDisconnect(t *testing.T) {
+	srv := mockmanager.Start(t, func(msg mockmanager.Message) []mockmanager.Message {
+		if msg.Type != "start" {
+			return nil
+		}
+		return nil // accepted silently; never resolves before the connection drops
+	})
+	d := newTestDeps(t, srv)
+	mgr := newTestManager(d)
+	src := &fakeSource{allowed: true}
+
+	if err := mgr.Do(context.Background(), src, "start"); err != nil {
+		t.Fatalf("Do: %v", err)
+	}
+	if !strings.Contains(src.last(), "起動して") {
+		t.Fatalf("last message = %q, want an in-progress notice", src.last())
+	}
+	firstReceivedRequestID(t, srv) // wait for Manager to actually receive it
+
+	srv.CloseConn()
+
+	waitForMessage(t, src, "接続が切れた")
 }
 
 // TestConcurrentStartCommands_RoutedIndependently is the end-to-end

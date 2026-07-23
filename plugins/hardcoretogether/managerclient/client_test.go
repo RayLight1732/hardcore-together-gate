@@ -13,9 +13,17 @@ import (
 	"github.com/minekube/gate-plugin-template/plugins/hardcoretogether/managerclient"
 )
 
-func newClient(t *testing.T, addr string) *managerclient.Client {
+// newClient applies configure (setting any On* callback fields) before
+// starting Run, never after: those fields are plain unsynchronized struct
+// fields (like the real Client is meant to be configured once via plugin.go
+// before Run starts), so setting one concurrently with Run already reading
+// it is a data race, not just bad style.
+func newClient(t *testing.T, addr string, configure ...func(*managerclient.Client)) *managerclient.Client {
 	t.Helper()
 	c := managerclient.New(addr, logr.Discard())
+	for _, fn := range configure {
+		fn(c)
+	}
 	ctx, cancel := context.WithCancel(context.Background())
 	t.Cleanup(cancel)
 	go c.Run(ctx)
@@ -63,13 +71,13 @@ func TestStartRejected(t *testing.T) {
 		return []mockmanager.Message{{Type: "start-rejected", Reason: "挑戦が進行中です"}}
 	})
 
-	c := newClient(t, srv.Addr)
-
 	type rejection struct{ requestID, reason string }
 	rejected := make(chan rejection, 1)
-	c.OnAdminRejected = func(_ context.Context, requestID, reason string) {
-		rejected <- rejection{requestID, reason}
-	}
+	c := newClient(t, srv.Addr, func(c *managerclient.Client) {
+		c.OnAdminRejected = func(_ context.Context, requestID, reason string) {
+			rejected <- rejection{requestID, reason}
+		}
+	})
 
 	requestID := managerclient.NewRequestID()
 	if err := c.Start(context.Background(), requestID, false, "Steve"); err != nil {
@@ -106,12 +114,12 @@ func TestStartAcceptedTriggersEvacuateHandshake(t *testing.T) {
 		return []mockmanager.Message{{Type: "evacuate-request", Reason: "force-reset"}}
 	})
 
-	c := newClient(t, srv.Addr)
-
 	evacuated := make(chan string, 1)
-	c.OnEvacuateRequest = func(_ context.Context, reason string) {
-		evacuated <- reason
-	}
+	c := newClient(t, srv.Addr, func(c *managerclient.Client) {
+		c.OnEvacuateRequest = func(_ context.Context, reason string) {
+			evacuated <- reason
+		}
+	})
 
 	requestID := managerclient.NewRequestID()
 	if err := c.Start(context.Background(), requestID, true, "Steve"); err != nil {
@@ -168,12 +176,12 @@ func TestAdminCompletedOnHardcoreReady(t *testing.T) {
 		return nil
 	})
 
-	c := newClient(t, srv.Addr)
-
 	completed := make(chan string, 1)
 	ready := make(chan struct{}, 1)
-	c.OnAdminCompleted = func(_ context.Context, requestID string) { completed <- requestID }
-	c.OnHardcoreReady = func(context.Context) { ready <- struct{}{} }
+	c := newClient(t, srv.Addr, func(c *managerclient.Client) {
+		c.OnAdminCompleted = func(_ context.Context, requestID string) { completed <- requestID }
+		c.OnHardcoreReady = func(context.Context) { ready <- struct{}{} }
+	})
 
 	requestID := managerclient.NewRequestID()
 	if err := c.Start(context.Background(), requestID, false, "Steve"); err != nil {
@@ -212,16 +220,16 @@ func TestAdminCompletedOnHardcoreReady(t *testing.T) {
 func TestAdminFailedAfterAcceptance(t *testing.T) {
 	srv := mockmanager.Start(t, func(mockmanager.Message) []mockmanager.Message { return nil })
 
-	c := newClient(t, srv.Addr)
-
 	type failure struct {
 		requestID, reason string
 		recovered         bool
 	}
 	failed := make(chan failure, 1)
-	c.OnAdminFailed = func(_ context.Context, requestID, reason string, recovered bool) {
-		failed <- failure{requestID, reason, recovered}
-	}
+	newClient(t, srv.Addr, func(c *managerclient.Client) {
+		c.OnAdminFailed = func(_ context.Context, requestID, reason string, recovered bool) {
+			failed <- failure{requestID, reason, recovered}
+		}
+	})
 
 	requestID := managerclient.NewRequestID()
 	srv.Push(mockmanager.Message{
@@ -264,17 +272,17 @@ func TestConcurrentAdminRequestsAreRoutedIndependently(t *testing.T) {
 		return []mockmanager.Message{{Type: "start-rejected", Reason: "処理中です"}}
 	})
 
-	c := newClient(t, srv.Addr)
-
 	type rejection struct{ requestID, reason string }
 	rejected := make(chan rejection, 2)
 	completed := make(chan string, 2)
-	c.OnAdminRejected = func(_ context.Context, requestID, reason string) {
-		rejected <- rejection{requestID, reason}
-	}
-	c.OnAdminCompleted = func(_ context.Context, requestID string) {
-		completed <- requestID
-	}
+	c := newClient(t, srv.Addr, func(c *managerclient.Client) {
+		c.OnAdminRejected = func(_ context.Context, requestID, reason string) {
+			rejected <- rejection{requestID, reason}
+		}
+		c.OnAdminCompleted = func(_ context.Context, requestID string) {
+			completed <- requestID
+		}
+	})
 
 	idA := managerclient.NewRequestID()
 	if err := c.Start(context.Background(), idA, false, "Alice"); err != nil {
@@ -327,10 +335,10 @@ func TestLoadRejected(t *testing.T) {
 		return []mockmanager.Message{{Type: "load-rejected", Reason: "アーカイブ save1 は存在しません"}}
 	})
 
-	c := newClient(t, srv.Addr)
-
 	rejected := make(chan string, 1)
-	c.OnAdminRejected = func(_ context.Context, _ string, reason string) { rejected <- reason }
+	c := newClient(t, srv.Addr, func(c *managerclient.Client) {
+		c.OnAdminRejected = func(_ context.Context, _ string, reason string) { rejected <- reason }
+	})
 
 	requestID := managerclient.NewRequestID()
 	if err := c.Load(context.Background(), requestID, "save1", false, "Steve"); err != nil {
@@ -360,10 +368,10 @@ func TestDeactivateRejected(t *testing.T) {
 		return []mockmanager.Message{{Type: "deactivate-rejected", Reason: "既に停止しています"}}
 	})
 
-	c := newClient(t, srv.Addr)
-
 	rejected := make(chan string, 1)
-	c.OnAdminRejected = func(_ context.Context, _ string, reason string) { rejected <- reason }
+	c := newClient(t, srv.Addr, func(c *managerclient.Client) {
+		c.OnAdminRejected = func(_ context.Context, _ string, reason string) { rejected <- reason }
+	})
 
 	requestID := managerclient.NewRequestID()
 	if err := c.Deactivate(context.Background(), requestID, "Steve"); err != nil {
@@ -393,12 +401,12 @@ func TestDeactivateAcceptedTriggersEvacuateHandshake(t *testing.T) {
 		return []mockmanager.Message{{Type: "evacuate-request", Reason: "deactivate"}}
 	})
 
-	c := newClient(t, srv.Addr)
-
 	evacuated := make(chan string, 1)
-	c.OnEvacuateRequest = func(_ context.Context, reason string) {
-		evacuated <- reason
-	}
+	c := newClient(t, srv.Addr, func(c *managerclient.Client) {
+		c.OnEvacuateRequest = func(_ context.Context, reason string) {
+			evacuated <- reason
+		}
+	})
 
 	requestID := managerclient.NewRequestID()
 	if err := c.Deactivate(context.Background(), requestID, "Steve"); err != nil {
@@ -418,10 +426,10 @@ func TestDeactivateAcceptedTriggersEvacuateHandshake(t *testing.T) {
 func TestDeactivateCompletePush(t *testing.T) {
 	srv := mockmanager.Start(t, func(mockmanager.Message) []mockmanager.Message { return nil })
 
-	c := newClient(t, srv.Addr)
-
 	completed := make(chan string, 1)
-	c.OnAdminCompleted = func(_ context.Context, requestID string) { completed <- requestID }
+	newClient(t, srv.Addr, func(c *managerclient.Client) {
+		c.OnAdminCompleted = func(_ context.Context, requestID string) { completed <- requestID }
+	})
 
 	srv.Push(mockmanager.Message{Type: "deactivate-complete", RequestID: "req-1"})
 
@@ -492,10 +500,10 @@ func TestSenpan(t *testing.T) {
 func TestHardcoreReadyPush(t *testing.T) {
 	srv := mockmanager.Start(t, func(mockmanager.Message) []mockmanager.Message { return nil })
 
-	c := newClient(t, srv.Addr)
-
 	ready := make(chan struct{}, 1)
-	c.OnHardcoreReady = func(context.Context) { ready <- struct{}{} }
+	newClient(t, srv.Addr, func(c *managerclient.Client) {
+		c.OnHardcoreReady = func(context.Context) { ready <- struct{}{} }
+	})
 
 	srv.Push(mockmanager.Message{Type: "hardcore-ready"})
 
@@ -571,6 +579,26 @@ func TestQueryStateNotBlockedByPendingAdminOp(t *testing.T) {
 	}
 	if state != managerclient.StateStarting {
 		t.Fatalf("state = %q, want starting", state)
+	}
+}
+
+// TestOnDisconnectedFiresOnConnectionDrop covers the hook that lets callers
+// notice a dropped connection (as opposed to polling Connected()): it must
+// fire once the read loop actually exits, not on every reconnect attempt.
+func TestOnDisconnectedFiresOnConnectionDrop(t *testing.T) {
+	srv := mockmanager.Start(t, func(mockmanager.Message) []mockmanager.Message { return nil })
+
+	disconnected := make(chan struct{}, 1)
+	newClient(t, srv.Addr, func(c *managerclient.Client) {
+		c.OnDisconnected = func(context.Context) { disconnected <- struct{}{} }
+	})
+
+	srv.CloseConn()
+
+	select {
+	case <-disconnected:
+	case <-time.After(time.Second):
+		t.Fatal("OnDisconnected was not called")
 	}
 }
 

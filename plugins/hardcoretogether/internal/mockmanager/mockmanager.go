@@ -17,6 +17,7 @@ import (
 // Message mirrors the NDJSON wire format of docs/protocol-gate-manager.md.
 type Message struct {
 	Type        string          `json:"type"`
+	RequestID   string          `json:"requestId,omitempty"`
 	State       string          `json:"state,omitempty"`
 	Running     string          `json:"running,omitempty"`
 	Clean       bool            `json:"clean,omitempty"`
@@ -24,6 +25,7 @@ type Message struct {
 	RequestedBy string          `json:"requestedBy,omitempty"`
 	Name        string          `json:"name,omitempty"`
 	Reason      string          `json:"reason,omitempty"`
+	Recovered   bool            `json:"recovered,omitempty"`
 	Mode        string          `json:"mode,omitempty"`
 	Events      json.RawMessage `json:"events,omitempty"`
 	Entries     json.RawMessage `json:"entries,omitempty"`
@@ -85,6 +87,13 @@ func (s *Server) serve(conn net.Conn) {
 		s.mu.Unlock()
 
 		for _, reply := range s.handler(msg) {
+			// Real Manager echoes the request's requestId on every
+			// response (docs/protocol-gate-manager.md 1節); do that here
+			// automatically so test handlers don't have to repeat it
+			// unless they explicitly want to send a different value.
+			if reply.RequestID == "" {
+				reply.RequestID = msg.RequestID
+			}
 			data, err := json.Marshal(reply)
 			if err != nil {
 				continue

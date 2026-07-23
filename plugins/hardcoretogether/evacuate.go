@@ -33,7 +33,7 @@ func (d *deps) onEvacuateRequest(ctx context.Context, reason string) {
 		wg.Add(1)
 		go func(player proxy.Player) {
 			defer wg.Done()
-			_ = player.SendMessage(msg)
+			d.notify(player, msg)
 			connCtx, cancel := context.WithTimeout(ctx, evacuateConnectTimeout)
 			defer cancel()
 			player.CreateConnectionRequest(lobby).ConnectWithIndication(connCtx)

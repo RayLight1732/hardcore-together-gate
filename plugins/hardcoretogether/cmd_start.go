@@ -13,25 +13,37 @@ import (
 // The process/world state checks themselves happen on Manager; this only
 // forwards the request and reports the outcome. Manager gives no
 // synchronous accept signal (docs/protocol-gate-manager.md 3.2節), so the
-// command replies immediately with an in-progress notice and the eventual
-// rejection, failure or completion arrives later via deps.admin (admin.go),
-// correlated by requestID.
+// eventual rejection, failure or completion arrives later via deps.admin
+// (admin.go), correlated by requestID.
 func startCommand(d *deps) brigodier.LiteralNodeBuilder {
 	run := func(clean bool) brigodier.Command {
+		notice := infoText("起動しています...")
+		if clean {
+			notice = infoText("挑戦をリセットしています...")
+		}
 		return command.Command(func(ctx *command.Context) error {
 			reqCtx, cancel := context.WithTimeout(context.Background(), commandTimeout)
 			defer cancel()
 
 			requestID := managerclient.NewRequestID()
 			d.admin.set(requestID, ctx.Source, "起動が完了しました")
+
+			// Sent before contacting Manager, not after: Start returns as
+			// soon as the request is transmitted, and dispatch() runs any
+			// rejection/failure callback on its own goroutine — one that
+			// can finish fast enough to beat this call if it ran
+			// afterward, so the player would see the in-progress notice
+			// overwrite (as the visually "last" message) a rejection that
+			// actually arrived first. Sending it first instead guarantees
+			// it happens-before the request is even sent, which is
+			// happens-before Manager could possibly reply.
+			d.notify(ctx.Source, notice)
+
 			if err := d.client.Start(reqCtx, requestID, clean, requesterName(ctx.Source)); err != nil {
 				d.admin.clear(requestID)
 				return ctx.Source.SendMessage(errorText("Managerと通信できません: " + err.Error()))
 			}
-			if clean {
-				return ctx.Source.SendMessage(infoText("挑戦をリセットしています..."))
-			}
-			return ctx.Source.SendMessage(infoText("起動しています..."))
+			return nil
 		})
 	}
 

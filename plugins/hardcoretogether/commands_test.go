@@ -70,6 +70,24 @@ func waitForMessage(t *testing.T, src *fakeSource, want string) {
 	}
 }
 
+// firstReceivedRequestID waits for srv to have received at least one message
+// and returns its requestID. The mock server appends to its received list
+// from its own goroutine reading the socket, so this can lag slightly
+// behind the send() call on Gate's side returning.
+func firstReceivedRequestID(t *testing.T, srv *mockmanager.Server) string {
+	t.Helper()
+	deadline := time.Now().Add(time.Second)
+	for {
+		if recv := srv.Received(); len(recv) > 0 {
+			return recv[0].RequestID
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("manager never received a message")
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+}
+
 // newTestDeps connects a managerclient.Client to srv and wraps it in deps
 // with no *proxy.Proxy. This is enough to exercise /start, /load,
 // /deactivate, /savedata and /senpan, which never touch d.proxy directly;
@@ -79,11 +97,12 @@ func newTestDeps(t *testing.T, srv *mockmanager.Server) *deps {
 	t.Helper()
 	client := managerclient.New(srv.Addr, logr.Discard())
 	d := &deps{client: client, log: logr.Discard()}
-	// onAdminRejected/onAdminCompleted never touch d.proxy (unlike
-	// OnEvacuateRequest/OnHardcoreReady), so it's safe to wire them up at
-	// this test tier.
+	// onAdminRejected/onAdminCompleted/onAdminFailed never touch d.proxy
+	// (unlike OnEvacuateRequest/OnHardcoreReady), so it's safe to wire them
+	// up at this test tier.
 	client.OnAdminRejected = d.onAdminRejected
 	client.OnAdminCompleted = d.onAdminCompleted
+	client.OnAdminFailed = d.onAdminFailed
 
 	ctx, cancel := context.WithCancel(context.Background())
 	t.Cleanup(cancel)
@@ -155,7 +174,7 @@ func TestStartCommand_CleanAccepted(t *testing.T) {
 		t.Fatalf("last message = %q, want an in-progress notice", src.last())
 	}
 
-	srv.Push(mockmanager.Message{Type: "hardcore-ready"})
+	srv.Push(mockmanager.Message{Type: "hardcore-ready", RequestID: firstReceivedRequestID(t, srv)})
 	waitForMessage(t, src, "完了")
 }
 
@@ -185,8 +204,88 @@ func TestStartCommand_PlainAccepted(t *testing.T) {
 		t.Fatalf("last message = %q, want an in-progress notice", src.last())
 	}
 
-	srv.Push(mockmanager.Message{Type: "hardcore-ready"})
+	srv.Push(mockmanager.Message{Type: "hardcore-ready", RequestID: firstReceivedRequestID(t, srv)})
 	waitForMessage(t, src, "完了")
+}
+
+// TestStartCommand_Failed covers start-failed (docs/protocol-gate-manager.md
+// 3.5b節): an accepted request that fails after acceptance (e.g. the
+// process crashed before becoming ready) surfaces reason and, when
+// recovered is false, an extra note that retrying alone may not help.
+func TestStartCommand_Failed(t *testing.T) {
+	srv := mockmanager.Start(t, func(msg mockmanager.Message) []mockmanager.Message {
+		if msg.Type != "start" {
+			return nil
+		}
+		return nil
+	})
+	d := newTestDeps(t, srv)
+	mgr := newTestManager(d)
+	src := &fakeSource{allowed: true}
+
+	if err := mgr.Do(context.Background(), src, "start"); err != nil {
+		t.Fatalf("Do: %v", err)
+	}
+
+	srv.Push(mockmanager.Message{
+		Type:      "start-failed",
+		RequestID: firstReceivedRequestID(t, srv),
+		Reason:    "process exited before ready",
+		Recovered: false,
+	})
+	waitForMessage(t, src, "process exited before ready")
+	if !strings.Contains(src.last(), "手動") {
+		t.Fatalf("last message = %q, want it to mention manual confirmation since recovered=false", src.last())
+	}
+}
+
+// TestConcurrentStartCommands_RoutedIndependently is the end-to-end
+// regression test for the bug this requestID mechanism fixes: two players
+// running /start around the same time used to share a single pending
+// slot, so the second player's request would silently overwrite the
+// first's — meaning the first player would see their initial "起動しています"
+// notice and then nothing else, ever. Each player must now get their own
+// correct outcome regardless of overlap.
+func TestConcurrentStartCommands_RoutedIndependently(t *testing.T) {
+	var mu sync.Mutex
+	firstSeen := ""
+	srv := mockmanager.Start(t, func(msg mockmanager.Message) []mockmanager.Message {
+		if msg.Type != "start" {
+			return nil
+		}
+		mu.Lock()
+		defer mu.Unlock()
+		if firstSeen == "" {
+			firstSeen = msg.RequestID
+			return nil // accepted silently; completed later via a pushed hardcore-ready
+		}
+		return []mockmanager.Message{{Type: "start-rejected", Reason: "処理中です"}}
+	})
+	d := newTestDeps(t, srv)
+	mgr := newTestManager(d)
+
+	alice := &fakeSource{allowed: true}
+	if err := mgr.Do(context.Background(), alice, "start"); err != nil {
+		t.Fatalf("Do (alice): %v", err)
+	}
+	aliceRequestID := firstReceivedRequestID(t, srv)
+
+	bob := &fakeSource{allowed: true}
+	if err := mgr.Do(context.Background(), bob, "start"); err != nil {
+		t.Fatalf("Do (bob): %v", err)
+	}
+
+	// Bob's request loses the race and must see his own rejection, not
+	// Alice's outcome.
+	waitForMessage(t, bob, "処理中です")
+
+	// Completing Alice's request must reach Alice, not Bob.
+	srv.Push(mockmanager.Message{Type: "hardcore-ready", RequestID: aliceRequestID})
+	waitForMessage(t, alice, "完了")
+
+	if strings.Contains(bob.last(), "完了") {
+		t.Fatalf("bob's last message = %q, should not have received Alice's completion notice", bob.last())
+	}
 }
 
 func TestStartCommand_RequiresPermission(t *testing.T) {
@@ -276,7 +375,7 @@ func TestDeactivateCommand_CompletesAfterEvacuation(t *testing.T) {
 		t.Fatalf("last message = %q, want an in-progress notice", src.last())
 	}
 
-	srv.Push(mockmanager.Message{Type: "deactivate-complete"})
+	srv.Push(mockmanager.Message{Type: "deactivate-complete", RequestID: firstReceivedRequestID(t, srv)})
 	waitForMessage(t, src, "停止しました")
 }
 

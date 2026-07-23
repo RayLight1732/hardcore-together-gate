@@ -5,6 +5,8 @@ import (
 
 	"go.minekube.com/brigodier"
 	"go.minekube.com/gate/pkg/command"
+
+	"github.com/minekube/gate-plugin-template/plugins/hardcoretogether/managerclient"
 )
 
 // startCommand implements /start and /start clean (docs/specification.md 2.1節).
@@ -12,16 +14,18 @@ import (
 // forwards the request and reports the outcome. Manager gives no
 // synchronous accept signal (docs/protocol-gate-manager.md 3.2節), so the
 // command replies immediately with an in-progress notice and the eventual
-// rejection or completion arrives later via deps.admin (admin.go).
+// rejection, failure or completion arrives later via deps.admin (admin.go),
+// correlated by requestID.
 func startCommand(d *deps) brigodier.LiteralNodeBuilder {
 	run := func(clean bool) brigodier.Command {
 		return command.Command(func(ctx *command.Context) error {
 			reqCtx, cancel := context.WithTimeout(context.Background(), commandTimeout)
 			defer cancel()
 
-			d.admin.set(ctx.Source, "起動が完了しました")
-			if err := d.client.Start(reqCtx, clean, requesterName(ctx.Source)); err != nil {
-				d.admin.clear()
+			requestID := managerclient.NewRequestID()
+			d.admin.set(requestID, ctx.Source, "起動が完了しました")
+			if err := d.client.Start(reqCtx, requestID, clean, requesterName(ctx.Source)); err != nil {
+				d.admin.clear(requestID)
 				return ctx.Source.SendMessage(errorText("Managerと通信できません: " + err.Error()))
 			}
 			if clean {

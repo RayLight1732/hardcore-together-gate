@@ -45,6 +45,7 @@ var Plugin = proxy.Plugin{
 		client.OnHardcoreReady = d.onHardcoreReady
 		client.OnAdminRejected = d.onAdminRejected
 		client.OnAdminCompleted = d.onAdminCompleted
+		client.OnAdminFailed = d.onAdminFailed
 		go client.Run(ctx)
 
 		registerPermissions(p, admins)

@@ -3,6 +3,7 @@ package managerclient_test
 import (
 	"context"
 	"encoding/json"
+	"sync"
 	"testing"
 	"time"
 
@@ -64,25 +65,32 @@ func TestStartRejected(t *testing.T) {
 
 	c := newClient(t, srv.Addr)
 
-	rejected := make(chan string, 1)
-	c.OnAdminRejected = func(_ context.Context, reason string) { rejected <- reason }
+	type rejection struct{ requestID, reason string }
+	rejected := make(chan rejection, 1)
+	c.OnAdminRejected = func(_ context.Context, requestID, reason string) {
+		rejected <- rejection{requestID, reason}
+	}
 
-	if err := c.Start(context.Background(), false, "Steve"); err != nil {
+	requestID := managerclient.NewRequestID()
+	if err := c.Start(context.Background(), requestID, false, "Steve"); err != nil {
 		t.Fatalf("Start: %v", err)
 	}
 
 	select {
-	case reason := <-rejected:
-		if reason != "挑戦が進行中です" {
-			t.Fatalf("OnAdminRejected reason = %q, want 挑戦が進行中です", reason)
+	case rej := <-rejected:
+		if rej.reason != "挑戦が進行中です" {
+			t.Fatalf("OnAdminRejected reason = %q, want 挑戦が進行中です", rej.reason)
+		}
+		if rej.requestID != requestID {
+			t.Fatalf("OnAdminRejected requestID = %q, want %q", rej.requestID, requestID)
 		}
 	case <-time.After(time.Second):
 		t.Fatal("OnAdminRejected was not called")
 	}
 
 	recv := srv.Received()
-	if len(recv) != 1 || recv[0].Clean || recv[0].RequestedBy != "Steve" {
-		t.Fatalf("manager received %+v, want single start{clean:false,requestedBy:Steve}", recv)
+	if len(recv) != 1 || recv[0].Clean || recv[0].RequestedBy != "Steve" || recv[0].RequestID != requestID {
+		t.Fatalf("manager received %+v, want single start{clean:false,requestedBy:Steve,requestId:%s}", recv, requestID)
 	}
 }
 
@@ -105,7 +113,8 @@ func TestStartAcceptedTriggersEvacuateHandshake(t *testing.T) {
 		evacuated <- reason
 	}
 
-	if err := c.Start(context.Background(), true, "Steve"); err != nil {
+	requestID := managerclient.NewRequestID()
+	if err := c.Start(context.Background(), requestID, true, "Steve"); err != nil {
 		t.Fatalf("Start: %v", err)
 	}
 
@@ -118,13 +127,14 @@ func TestStartAcceptedTriggersEvacuateHandshake(t *testing.T) {
 		t.Fatal("OnEvacuateRequest was not called")
 	}
 
-	// The client must send evacuate-complete on its own once the callback returns.
+	// The client must send evacuate-complete on its own once the callback
+	// returns, echoing back Manager's evacuate-request requestId.
 	deadline := time.Now().Add(time.Second)
 	for {
 		recv := srv.Received()
 		if len(recv) >= 2 {
-			if recv[1].Type != "evacuate-complete" {
-				t.Fatalf("second message = %+v, want evacuate-complete", recv[1])
+			if recv[1].Type != "evacuate-complete" || recv[1].RequestID != requestID {
+				t.Fatalf("second message = %+v, want evacuate-complete{requestId:%s}", recv[1], requestID)
 			}
 			break
 		}
@@ -135,8 +145,8 @@ func TestStartAcceptedTriggersEvacuateHandshake(t *testing.T) {
 	}
 
 	recvFirst := srv.Received()[0]
-	if !recvFirst.Clean || recvFirst.RequestedBy != "Steve" {
-		t.Fatalf("manager received %+v, want start{clean:true,requestedBy:Steve}", recvFirst)
+	if !recvFirst.Clean || recvFirst.RequestedBy != "Steve" || recvFirst.RequestID != requestID {
+		t.Fatalf("manager received %+v, want start{clean:true,requestedBy:Steve,requestId:%s}", recvFirst, requestID)
 	}
 }
 
@@ -144,8 +154,9 @@ func TestStartAcceptedTriggersEvacuateHandshake(t *testing.T) {
 // accepted against an already-stopped process: Manager sends no immediate
 // acknowledgement at all (docs/protocol-gate-manager.md 3.2節), so
 // hardcore-ready is the only signal that ever arrives, and it must reach
-// both OnAdminCompleted (the pending command's own completion notice) and
-// OnHardcoreReady (the lobby-wide auto-transfer) independently.
+// both OnAdminCompleted (the pending command's own completion notice,
+// carrying the original requestID) and OnHardcoreReady (the lobby-wide
+// auto-transfer) independently.
 func TestAdminCompletedOnHardcoreReady(t *testing.T) {
 	srv := mockmanager.Start(t, func(msg mockmanager.Message) []mockmanager.Message {
 		if msg.Type != "start" {
@@ -159,12 +170,13 @@ func TestAdminCompletedOnHardcoreReady(t *testing.T) {
 
 	c := newClient(t, srv.Addr)
 
-	completed := make(chan struct{}, 1)
+	completed := make(chan string, 1)
 	ready := make(chan struct{}, 1)
-	c.OnAdminCompleted = func(context.Context) { completed <- struct{}{} }
+	c.OnAdminCompleted = func(_ context.Context, requestID string) { completed <- requestID }
 	c.OnHardcoreReady = func(context.Context) { ready <- struct{}{} }
 
-	if err := c.Start(context.Background(), false, "Steve"); err != nil {
+	requestID := managerclient.NewRequestID()
+	if err := c.Start(context.Background(), requestID, false, "Steve"); err != nil {
 		t.Fatalf("Start: %v", err)
 	}
 
@@ -176,10 +188,13 @@ func TestAdminCompletedOnHardcoreReady(t *testing.T) {
 		time.Sleep(5 * time.Millisecond)
 	}
 
-	srv.Push(mockmanager.Message{Type: "hardcore-ready"})
+	srv.Push(mockmanager.Message{Type: "hardcore-ready", RequestID: requestID})
 
 	select {
-	case <-completed:
+	case got := <-completed:
+		if got != requestID {
+			t.Fatalf("OnAdminCompleted requestID = %q, want %q", got, requestID)
+		}
 	case <-time.After(time.Second):
 		t.Fatal("OnAdminCompleted was not called")
 	}
@@ -190,38 +205,117 @@ func TestAdminCompletedOnHardcoreReady(t *testing.T) {
 	}
 }
 
-// TestQueryStateNotBlockedByPendingAdminOp guards against a regression: an
-// accepted Start/Load against an already-stopped process can stay pending
-// until hardcore fully boots (docs/protocol-gate-manager.md 3.2節), and that
-// must never block unrelated synchronous calls like /rta's QueryState,
-// which players naturally keep using while waiting for the server to come
-// up.
-func TestQueryStateNotBlockedByPendingAdminOp(t *testing.T) {
+// TestAdminFailedAfterAcceptance covers start-failed (docs/protocol-gate-manager.md
+// 3.5b節): an accepted request that later fails (e.g. the process crashed
+// before becoming ready) delivers reason/recovered via OnAdminFailed,
+// carrying the original requestID.
+func TestAdminFailedAfterAcceptance(t *testing.T) {
+	srv := mockmanager.Start(t, func(mockmanager.Message) []mockmanager.Message { return nil })
+
+	c := newClient(t, srv.Addr)
+
+	type failure struct {
+		requestID, reason string
+		recovered         bool
+	}
+	failed := make(chan failure, 1)
+	c.OnAdminFailed = func(_ context.Context, requestID, reason string, recovered bool) {
+		failed <- failure{requestID, reason, recovered}
+	}
+
+	requestID := managerclient.NewRequestID()
+	srv.Push(mockmanager.Message{
+		Type:      "start-failed",
+		RequestID: requestID,
+		Reason:    "process exited before ready",
+		Recovered: false,
+	})
+
+	select {
+	case f := <-failed:
+		if f.requestID != requestID || f.reason != "process exited before ready" || f.recovered {
+			t.Fatalf("got %+v, want {requestID:%s reason:process exited before ready recovered:false}", f, requestID)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("OnAdminFailed was not called")
+	}
+}
+
+// TestConcurrentAdminRequestsAreRoutedIndependently guards against a
+// regression of a real bug: without per-request correlation, two
+// concurrent admin requests (e.g. /start from two different players) would
+// share a single pending slot, so whichever request's outcome arrived
+// second would silently overwrite/lose the first's. requestID
+// (docs/protocol-gate-manager.md 1節) fixes this — each outcome must route
+// back by its own requestID regardless of how many requests are in flight.
+func TestConcurrentAdminRequestsAreRoutedIndependently(t *testing.T) {
+	var mu sync.Mutex
+	firstSeen := ""
 	srv := mockmanager.Start(t, func(msg mockmanager.Message) []mockmanager.Message {
-		switch msg.Type {
-		case "state-query":
-			return []mockmanager.Message{{Type: "state-response", State: "starting", Running: "true"}}
-		default:
-			// No reply to "start": simulates hardcore still booting, with
-			// no hardcore-ready pushed for the lifetime of this test.
+		if msg.Type != "start" {
 			return nil
 		}
+		mu.Lock()
+		defer mu.Unlock()
+		if firstSeen == "" {
+			firstSeen = msg.RequestID
+			return nil // accepted silently; completed later via a pushed hardcore-ready
+		}
+		return []mockmanager.Message{{Type: "start-rejected", Reason: "処理中です"}}
 	})
 
 	c := newClient(t, srv.Addr)
 
-	if err := c.Start(context.Background(), false, "Steve"); err != nil {
-		t.Fatalf("Start: %v", err)
+	type rejection struct{ requestID, reason string }
+	rejected := make(chan rejection, 2)
+	completed := make(chan string, 2)
+	c.OnAdminRejected = func(_ context.Context, requestID, reason string) {
+		rejected <- rejection{requestID, reason}
+	}
+	c.OnAdminCompleted = func(_ context.Context, requestID string) {
+		completed <- requestID
 	}
 
-	qctx, cancel := context.WithTimeout(context.Background(), time.Second)
-	defer cancel()
-	state, _, err := c.QueryState(qctx)
-	if err != nil {
-		t.Fatalf("QueryState: %v", err)
+	idA := managerclient.NewRequestID()
+	if err := c.Start(context.Background(), idA, false, "Alice"); err != nil {
+		t.Fatalf("Start (Alice): %v", err)
 	}
-	if state != managerclient.StateStarting {
-		t.Fatalf("state = %q, want starting", state)
+
+	deadline := time.Now().Add(time.Second)
+	for len(srv.Received()) < 1 {
+		if time.Now().After(deadline) {
+			t.Fatal("manager never received Alice's start")
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+
+	idB := managerclient.NewRequestID()
+	if err := c.Start(context.Background(), idB, false, "Bob"); err != nil {
+		t.Fatalf("Start (Bob): %v", err)
+	}
+
+	// Bob's request loses the race and must be rejected under his own
+	// requestID, not Alice's.
+	select {
+	case rej := <-rejected:
+		if rej.requestID != idB {
+			t.Fatalf("rejected requestID = %q, want %q (Bob's)", rej.requestID, idB)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("expected a rejection for Bob's start")
+	}
+
+	// Alice's request is still pending; completing it must route to her
+	// requestID, even though Bob's request was sent (and rejected) in the
+	// meantime.
+	srv.Push(mockmanager.Message{Type: "hardcore-ready", RequestID: idA})
+	select {
+	case got := <-completed:
+		if got != idA {
+			t.Fatalf("completed requestID = %q, want %q (Alice's)", got, idA)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("expected a completion for Alice's start")
 	}
 }
 
@@ -236,9 +330,10 @@ func TestLoadRejected(t *testing.T) {
 	c := newClient(t, srv.Addr)
 
 	rejected := make(chan string, 1)
-	c.OnAdminRejected = func(_ context.Context, reason string) { rejected <- reason }
+	c.OnAdminRejected = func(_ context.Context, _ string, reason string) { rejected <- reason }
 
-	if err := c.Load(context.Background(), "save1", false, "Steve"); err != nil {
+	requestID := managerclient.NewRequestID()
+	if err := c.Load(context.Background(), requestID, "save1", false, "Steve"); err != nil {
 		t.Fatalf("Load: %v", err)
 	}
 
@@ -252,8 +347,8 @@ func TestLoadRejected(t *testing.T) {
 	}
 
 	recv := srv.Received()
-	if len(recv) != 1 || recv[0].Name != "save1" {
-		t.Fatalf("manager received %+v, want single load{name:save1}", recv)
+	if len(recv) != 1 || recv[0].Name != "save1" || recv[0].RequestID != requestID {
+		t.Fatalf("manager received %+v, want single load{name:save1,requestId:%s}", recv, requestID)
 	}
 }
 
@@ -268,9 +363,10 @@ func TestDeactivateRejected(t *testing.T) {
 	c := newClient(t, srv.Addr)
 
 	rejected := make(chan string, 1)
-	c.OnAdminRejected = func(_ context.Context, reason string) { rejected <- reason }
+	c.OnAdminRejected = func(_ context.Context, _ string, reason string) { rejected <- reason }
 
-	if err := c.Deactivate(context.Background(), "Steve"); err != nil {
+	requestID := managerclient.NewRequestID()
+	if err := c.Deactivate(context.Background(), requestID, "Steve"); err != nil {
 		t.Fatalf("Deactivate: %v", err)
 	}
 
@@ -284,8 +380,8 @@ func TestDeactivateRejected(t *testing.T) {
 	}
 
 	recv := srv.Received()
-	if len(recv) != 1 || recv[0].RequestedBy != "Steve" {
-		t.Fatalf("manager received %+v, want single deactivate{requestedBy:Steve}", recv)
+	if len(recv) != 1 || recv[0].RequestedBy != "Steve" || recv[0].RequestID != requestID {
+		t.Fatalf("manager received %+v, want single deactivate{requestedBy:Steve,requestId:%s}", recv, requestID)
 	}
 }
 
@@ -304,7 +400,8 @@ func TestDeactivateAcceptedTriggersEvacuateHandshake(t *testing.T) {
 		evacuated <- reason
 	}
 
-	if err := c.Deactivate(context.Background(), "Steve"); err != nil {
+	requestID := managerclient.NewRequestID()
+	if err := c.Deactivate(context.Background(), requestID, "Steve"); err != nil {
 		t.Fatalf("Deactivate: %v", err)
 	}
 
@@ -323,13 +420,16 @@ func TestDeactivateCompletePush(t *testing.T) {
 
 	c := newClient(t, srv.Addr)
 
-	completed := make(chan struct{}, 1)
-	c.OnAdminCompleted = func(context.Context) { completed <- struct{}{} }
+	completed := make(chan string, 1)
+	c.OnAdminCompleted = func(_ context.Context, requestID string) { completed <- requestID }
 
-	srv.Push(mockmanager.Message{Type: "deactivate-complete"})
+	srv.Push(mockmanager.Message{Type: "deactivate-complete", RequestID: "req-1"})
 
 	select {
-	case <-completed:
+	case got := <-completed:
+		if got != "req-1" {
+			t.Fatalf("OnAdminCompleted requestID = %q, want req-1", got)
+		}
 	case <-time.After(time.Second):
 		t.Fatal("OnAdminCompleted was not called")
 	}
@@ -403,6 +503,74 @@ func TestHardcoreReadyPush(t *testing.T) {
 	case <-ready:
 	case <-time.After(time.Second):
 		t.Fatal("OnHardcoreReady was not called")
+	}
+}
+
+// TestConcurrentQueryStates covers the sync lane (QueryState/SaveData/
+// Senpan): now that responses are matched by requestID instead of relying
+// on only one call ever being in flight, concurrent calls must each get
+// their own correct response rather than being serialized or cross-wired.
+func TestConcurrentQueryStates(t *testing.T) {
+	srv := mockmanager.Start(t, func(msg mockmanager.Message) []mockmanager.Message {
+		if msg.Type != "state-query" {
+			return nil
+		}
+		return []mockmanager.Message{{Type: "state-response", State: "ready", Running: "true"}}
+	})
+
+	c := newClient(t, srv.Addr)
+
+	var wg sync.WaitGroup
+	for i := 0; i < 10; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			state, running, err := c.QueryState(context.Background())
+			if err != nil {
+				t.Errorf("QueryState: %v", err)
+				return
+			}
+			if state != managerclient.StateReady || running != managerclient.RunningTrue {
+				t.Errorf("got state=%q running=%q, want ready/true", state, running)
+			}
+		}()
+	}
+	wg.Wait()
+}
+
+// TestQueryStateNotBlockedByPendingAdminOp guards against a regression: an
+// accepted Start/Load against an already-stopped process can stay pending
+// until hardcore fully boots (docs/protocol-gate-manager.md 3.2節), and that
+// must never block unrelated synchronous calls like /rta's QueryState,
+// which players naturally keep using while waiting for the server to come
+// up.
+func TestQueryStateNotBlockedByPendingAdminOp(t *testing.T) {
+	srv := mockmanager.Start(t, func(msg mockmanager.Message) []mockmanager.Message {
+		switch msg.Type {
+		case "state-query":
+			return []mockmanager.Message{{Type: "state-response", State: "starting", Running: "true"}}
+		default:
+			// No reply to "start": simulates hardcore still booting, with
+			// no hardcore-ready pushed for the lifetime of this test.
+			return nil
+		}
+	})
+
+	c := newClient(t, srv.Addr)
+
+	requestID := managerclient.NewRequestID()
+	if err := c.Start(context.Background(), requestID, false, "Steve"); err != nil {
+		t.Fatalf("Start: %v", err)
+	}
+
+	qctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+	state, _, err := c.QueryState(qctx)
+	if err != nil {
+		t.Fatalf("QueryState: %v", err)
+	}
+	if state != managerclient.StateStarting {
+		t.Fatalf("state = %q, want starting", state)
 	}
 }
 

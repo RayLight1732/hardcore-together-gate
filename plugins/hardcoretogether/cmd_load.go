@@ -5,13 +5,16 @@ import (
 
 	"go.minekube.com/brigodier"
 	"go.minekube.com/gate/pkg/command"
+
+	"github.com/minekube/gate-plugin-template/plugins/hardcoretogether/managerclient"
 )
 
 // loadCommand implements /load <name>, /load <name> force, /load latest and
 // /load latest force (docs/specification.md 2.1節). "latest" is just the string
 // value of name; resolving it to the newest archive happens on Manager.
 // Like /start, this replies immediately with an in-progress notice and the
-// eventual rejection or completion arrives later via deps.admin (admin.go).
+// eventual rejection, failure or completion arrives later via deps.admin
+// (admin.go), correlated by requestID.
 func loadCommand(d *deps) brigodier.LiteralNodeBuilder {
 	run := func(force bool) brigodier.Command {
 		return command.Command(func(ctx *command.Context) error {
@@ -20,9 +23,10 @@ func loadCommand(d *deps) brigodier.LiteralNodeBuilder {
 			reqCtx, cancel := context.WithTimeout(context.Background(), commandTimeout)
 			defer cancel()
 
-			d.admin.set(ctx.Source, "アーカイブの復元が完了しました")
-			if err := d.client.Load(reqCtx, name, force, requesterName(ctx.Source)); err != nil {
-				d.admin.clear()
+			requestID := managerclient.NewRequestID()
+			d.admin.set(requestID, ctx.Source, "アーカイブの復元が完了しました")
+			if err := d.client.Load(reqCtx, requestID, name, force, requesterName(ctx.Source)); err != nil {
+				d.admin.clear(requestID)
 				return ctx.Source.SendMessage(errorText("Managerと通信できません: " + err.Error()))
 			}
 			return ctx.Source.SendMessage(infoText("アーカイブを復元しています..."))
